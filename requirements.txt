@@ -1,0 +1,17 @@
+# CST-SSM 依赖
+# 核心（必需）
+torch>=2.1
+safetensors>=0.4
+numpy>=1.24
+pyyaml>=6.0
+
+# 可选（生产/加速）——缺失时代码自动降级，不影响 smoke test
+# transformers>=4.57      # 接入 Qwen3-VL 视觉塔+LLM（cst_ssm/integrations/qwen3_vl.py）
+# decord>=0.6             # 按 frame_idx 精确随机访问解码（data_pipeline 抽特征/采样）
+# bitsandbytes>=0.43      # 8bit AdamW 进一步省显存
+# mamba-ssm>=2.0          # Mamba-2 SSD CUDA 内核（替换纯 PyTorch 扫描，加速）
+# causal-conv1d>=1.2      # mamba-ssm 依赖
+# einops>=0.7             # 张量重排（本仓库未强依赖）
+# h5py>=3.8               # 备选特征缓存格式
+# timm>=0.9               # 预训练视觉骨干（替换内置窗口编码器）
+# flash-attn>=2.5         # 加速注意力

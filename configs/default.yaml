@@ -1,0 +1,40 @@
+# CST-SSM 默认配置（小规模，可在 CPU 跑通；生产按注释放大）
+model:
+  input_mode: feature        # feature | pixel
+  feat_dim: 768              # 视觉骨干输出维（feature 模式）；生产常见 768/1024
+  d_model: 384               # 时序建模维；生产 768/1024
+  gate_init_eps: 0.1         # 事件门控初始阈值
+  eacs_chunk: 32             # EACS 分块梯度检查点大小（省显存）；0=关闭
+  pretrain_horizon: 1
+  # 三尺度分支（秒/分钟/小时），状态维比≈1:2:4
+  branches:
+    - {name: short, n_state: 16, tau_min: 0.1,  tau_max: 1.0,    imag_scale: 1.0}
+    - {name: mid,   n_state: 32, tau_min: 10.0, tau_max: 60.0,   imag_scale: 0.3}
+    - {name: long,  n_state: 64, tau_min: 600.0, tau_max: 3600.0, imag_scale: 0.1}
+  llm:
+    vocab_size: 259          # ByteTokenizer；接真实 LLM 时改为其词表大小
+    dim: 512                 # 生产接 7B 时由 HF 模型决定
+    n_layer: 6
+    n_head: 8
+    cross_every: 2           # 每隔几层插入门控交叉注意力
+    max_len: 2048
+
+train:
+  stage: finetune            # finetune | pretrain
+  lr: 1.0e-4
+  weight_decay: 0.05
+  grad_accum: 4              # 梯度累积省显存
+  max_steps: 1000
+  grad_clip: 1.0
+  bf16: true
+  eacs_chunk: 32
+  t_start: 1.0               # 门控温度退火
+  t_end: 0.05
+  ckpt_dir: checkpoints
+  ckpt_every: 500
+
+loss:
+  task: 1.0
+  pred: 0.5
+  update_rate: 0.1           # 更新率正则（越大越稀疏）
+  spectral: 0.05             # 谱防坍缩
