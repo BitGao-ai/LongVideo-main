@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -52,4 +54,4 @@ def make_loader(dataset, batch_size: int = 2, shuffle: bool = True,
                 pixel: bool = False, num_workers: int = 0, pad_id: int = 256) -> DataLoader:
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers,
-                      collate_fn=lambda b: collate_fn(b, pad_id=pad_id, pixel=pixel))
+                      collate_fn=partial(collate_fn, pad_id=pad_id, pixel=pixel))

@@ -48,8 +48,10 @@ class MultiScaleEACS(nn.Module):
         self.out_norm = nn.LayerNorm(d_model)
 
     def forward(self, x: Tensor, timestamps: Tensor,
-                frame_mask: Tensor | None = None) -> MultiScaleOutput:
-        outs: list[EACSOutput] = [br(x, timestamps) for br in self.branches]
+                frame_mask: Tensor | None = None,
+                cpi: Tensor | None = None) -> MultiScaleOutput:
+        """cpi: 可选 (B,L) 帧级 CPI 信号，贯通各分支 EventGate（P1.5 统一主线）。"""
+        outs: list[EACSOutput] = [br(x, timestamps, cpi=cpi) for br in self.branches]
         deltas = torch.stack([o.y for o in outs], dim=-1)          # (B,L,d,n_branch)
         w = torch.softmax(self.fusion(x), dim=-1)                  # (B,L,n_branch)
         fused = torch.einsum("bldn,bln->bld", deltas, w)

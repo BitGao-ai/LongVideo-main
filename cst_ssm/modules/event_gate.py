@@ -51,12 +51,18 @@ class EventGate(nn.Module):
         temperature     : 软门控温度 T（外部退火，见 train）；越小越接近硬门控
         use_ste         : True 时前向硬门控、反向用软门控梯度（直通估计）
     残差沿最后一维（特征/通道）取 L2 范数 → 每(样本,步)一个标量残差（分支级事件决策）。
+
+    CPI 贯通（P1.5，设计§2.2）：可选输入 cpi 信号调制阈值：
+        ε_eff = ε * (1 - cpi_modulation * cpi)
+        高 CPI（重要事件）→ ε 降低 → 更易触发更新（小 Δt）
+        低 CPI（静态片段）→ ε 保持 → 更稀疏更新（大 Δt）
     """
 
     def __init__(self, eps_min: float = 0.01, eps_max: float = 0.9,
                  init_eps: float = 0.1, temperature: float = 0.1,
                  use_ste: bool = True, norm_eta: float = 1e-6,
-                 gate_kind: str = "event", random_rate: float = 0.5):
+                 gate_kind: str = "event", random_rate: float = 0.5,
+                 cpi_modulation: float = 0.0):
         super().__init__()
         self.eps_min = eps_min
         self.eps_max = eps_max
@@ -64,6 +70,7 @@ class EventGate(nn.Module):
         self.use_ste = use_ste
         self.gate_kind = gate_kind        # "event"(默认) | "random" | "always"（消融）
         self.random_rate = random_rate    # random 门控的目标更新率
+        self.cpi_modulation = cpi_modulation  # >0 启用 CPI 调制（P1.5）
         # 反解 raw 使 sigmoid(raw) 映射到 init_eps
         frac = (init_eps - eps_min) / max(eps_max - eps_min, 1e-6)
         frac = min(max(frac, 1e-4), 1 - 1e-4)
@@ -91,15 +98,20 @@ class EventGate(nn.Module):
         return num / den
 
     def forward(self, obs: Tensor, pred: Tensor,
-                eps_override: Tensor | None = None) -> tuple[Tensor, Tensor]:
+                eps_override: Tensor | None = None,
+                cpi: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """返回 (gate, r)。gate∈[0,1]（软，训练）或∈{0,1}（硬，推理/STE 前向）。
-        eps_override：可选逐样本阈值（鲁棒兜底用），覆盖 self.eps。"""
+        eps_override：可选逐样本阈值（鲁棒兖底用），覆盖 self.eps。
+        cpi：可选帧级 CPI 信号 (B,)，调制阈值（P1.5 统一主线）。"""
         r = self.residual(obs, pred)                    # (…,)
         if self.gate_kind == "always":                  # 消融：稠密（无门控）
             return torch.ones_like(r), r
         if self.gate_kind == "random":                  # 消融：随机跳更新（对照残差驱动）
             return (torch.rand_like(r) < self.random_rate).to(r.dtype), r
         eps = self.eps if eps_override is None else eps_override
+        # CPI 调制：高 CPI → 降低 ε → 更易触发更新（设计 §2.2 统一主线）
+        if cpi is not None and self.cpi_modulation > 0:
+            eps = eps * (1.0 - self.cpi_modulation * cpi.clamp(0, 1))
         soft = torch.sigmoid((r - eps) / self.temperature.clamp_min(1e-4))
         if not self.training:
             return (r > eps).to(r.dtype), r

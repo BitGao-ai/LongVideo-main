@@ -125,7 +125,8 @@ class WindowedSpatialEncoder(nn.Module):
 class FeatureAdapter(nn.Module):
     """从预抽取的 patch 特征 (B,L,P,d_in) 适配为帧级特征 (B,L,d_out)。
 
-    配合"特征缓存"数据流（见 data/）：视觉骨干离线跑好，训练只读特征，省显存与算力。
+    配合“特征缓存”数据流（见 data/）：视觉骨干离线跑好，训练只读特征，省显存与算力。
+    提供 get_tokens() 返回投影后的逐 token 特征 (B,L,P,d_out)，供 CPIBDistill/CGU 消费。
     """
 
     def __init__(self, d_in: int, d_out: int, n_heads: int = 8):
@@ -135,9 +136,13 @@ class FeatureAdapter(nn.Module):
         self.attn_pool = nn.MultiheadAttention(d_out, n_heads, batch_first=True)
         self.query = nn.Parameter(torch.randn(1, 1, d_out) * 0.02)
 
+    def get_tokens(self, feats: Tensor) -> Tensor:
+        """返回投影+归一化后的逐 token 特征 (B,L,P,d_out)，供 CGU 蒸馏。"""
+        return self.norm(self.proj(feats))              # (B, L, P, d_out)
+
     def forward(self, feats: Tensor) -> Tensor:
         B, L, P, d_in = feats.shape
-        x = self.norm(self.proj(feats)).reshape(B * L, P, -1)
+        x = self.get_tokens(feats).reshape(B * L, P, -1)
         q = self.query.expand(B * L, 1, -1)
         pooled, _ = self.attn_pool(q, x, x)           # 注意力池化 → (B*L,1,d_out)
         return pooled.view(B, L, -1)

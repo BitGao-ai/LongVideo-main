@@ -118,7 +118,7 @@ class EACSLayer(nn.Module):
 
     # ---- 单步 segment cell ----
     def _step(self, lam, h_pi, t_pi, u_pi, B_pi, C_pi,
-              t_k, u_k, B_k, C_k, eps_override=None):
+              t_k, u_k, B_k, C_k, eps_override=None, cpi_k=None):
         """一步：返回 (h_cur, y_k, gate, r, 新提交状态...)。全部 vectorized over (B,H,N)。"""
         # 离散化步长（消融）：continuous=真实Δt / fixed=常数 / learned=输入依赖(Mamba风格)
         if self.disc_mode == "learned":
@@ -136,7 +136,8 @@ class EACSLayer(nn.Module):
 
         # 门控（观测=当前输入 u_k；统计只读，更新统一在 forward 里做一次，避免检查点双更新/推理误更新）
         obs = self.obs_norm.apply_stats(u_k)
-        g, r = self.gate(obs, self.obs_norm.apply_stats(y_hat), eps_override=eps_override)  # g:(B,), r:(B,)
+        g, r = self.gate(obs, self.obs_norm.apply_stats(y_hat),
+                         eps_override=eps_override, cpi=cpi_k)  # g:(B,), r:(B,)
 
         # 更新分支（注入当前输入 u_k、B_k）
         dA_u, dB_u = zoh_discretize(lam, dt_eff, B_k)
@@ -155,11 +156,12 @@ class EACSLayer(nn.Module):
         y_k = _readout(h_cur, C_k) + self.D * u_k            # (B,H)
         return h_cur, y_k, g, r, h_pi_n, t_pi_n, u_pi_n, B_pi_n, C_pi_n
 
-    def _scan_range(self, lam, state, u, Bc, Cc, t, k0, k1):
+    def _scan_range(self, lam, state, u, Bc, Cc, t, k0, k1, cpi=None):
         """扫描 [k0,k1) 区间，返回 (ys, gs, rs, 末态)。state=(h_pi,t_pi,u_pi,B_pi,C_pi)。
-
+    
+        cpi: 可选 (B,L) 帧级 CPI 信号（P1.5 统一主线）。
         robust_guard 时维护连续残差暴涨计数：连续 robust_k 帧 r 阶跃暴涨 → 该步降 ε 进高密度更新，
-        平稳后自动恢复（设计 §4.4）。注：分块检查点下 spike 计数在块边界重置（兜底机制，影响小）。
+        平稳后自动恢复（设计 §4.4）。注：分块检查点下 spike 计数在块边界重置（兖底机制，影响小）。
         """
         h_pi, t_pi, u_pi, B_pi, C_pi = state
         ys, gs, rs = [], [], []
@@ -173,7 +175,8 @@ class EACSLayer(nn.Module):
                                      base * self.robust_eps_factor, base)   # (B,)
             h_cur, y_k, g, r, h_pi, t_pi, u_pi, B_pi, C_pi = self._step(
                 lam, h_pi, t_pi, u_pi, B_pi, C_pi,
-                t[:, k], u[:, k], Bc[:, k], Cc[:, k], eps_override=eps_ov)
+                t[:, k], u[:, k], Bc[:, k], Cc[:, k], eps_override=eps_ov,
+                cpi_k=(cpi[:, k] if cpi is not None else None))
             ys.append(y_k); gs.append(g); rs.append(r)
             if self.robust_guard:
                 if prev_r is not None:
@@ -183,8 +186,8 @@ class EACSLayer(nn.Module):
         ys = torch.stack(ys, 1); gs = torch.stack(gs, 1); rs = torch.stack(rs, 1)
         return ys, gs, rs, (h_pi, t_pi, u_pi, B_pi, C_pi)
 
-    def forward(self, x: Tensor, timestamps: Tensor) -> EACSOutput:
-        """x:(B,L,d_model) timestamps:(B,L) 秒。返回 EACSOutput（y 已含残差连接）。"""
+    def forward(self, x: Tensor, timestamps: Tensor, cpi: Tensor | None = None) -> EACSOutput:
+        """x:(B,L,d_model) timestamps:(B,L) 秒。cpi: 可选(B,L) CPI 信号（P1.5）。返回 EACSOutput。"""
         B, L, _ = x.shape
         # 推理路径：GPU 上有融合内核则整段一次跑完（显存 O(B·H·N)）；否则走下方序列 cell
         if (not self.training) and x.is_cuda and self._fast_paths_ok():
@@ -234,12 +237,12 @@ class EACSLayer(nn.Module):
             for k0 in range(0, L, cs):
                 k1 = min(k0 + cs, L)
                 ys, gs, rs, state = ckpt.checkpoint(
-                    self._scan_range, lam, state, u, Bc, Cc, t, k0, k1,
+                    self._scan_range, lam, state, u, Bc, Cc, t, k0, k1, cpi,
                     use_reentrant=False)
                 ys_all.append(ys); gs_all.append(gs); rs_all.append(rs)
             ys = torch.cat(ys_all, 1); gs = torch.cat(gs_all, 1); rs = torch.cat(rs_all, 1)
         else:
-            ys, gs, rs, state = self._scan_range(lam, state, u, Bc, Cc, t, 0, L)
+            ys, gs, rs, state = self._scan_range(lam, state, u, Bc, Cc, t, 0, L, cpi=cpi)
 
         delta = self.proj_out(ys.to(x_in.dtype))            # (B,L,d) 分支增量
         y = x_in + delta if self.add_residual else delta

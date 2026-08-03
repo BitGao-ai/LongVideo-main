@@ -2,12 +2,16 @@
 
 - ByteTokenizer        : 零依赖字节级分词器（stand-in，便于 smoke test；生产替换为 LLM 自带分词器）
 - VideoTemporalDataset : 读 jsonl manifest + 每视频 .npz 特征缓存（内存映射，省内存）
+                         或 frame_dir 像素模式（端到端从帧图）
 - SyntheticVideoDataset: 合成数据，用于无数据时跑通全流程
+
+错误隔离：__getitem__ 内单样本失败时随机替换另一条，不中断训练。
 """
 from __future__ import annotations
 
 import json
 import os
+import random
 
 import numpy as np
 import torch
@@ -40,6 +44,7 @@ class VideoTemporalDataset(Dataset):
         self.root = data_root
         with open(cfg.manifest) as f:
             self.rows = [json.loads(l) for l in f if l.strip()]
+        self._pixel = (cfg.mode == "pixel")
 
     def __len__(self):
         return len(self.rows)
@@ -58,6 +63,40 @@ class VideoTemporalDataset(Dataset):
         z = np.load(path)                                      # .npz 整载解压
         return z["features"], np.asarray(z["timestamps"], dtype=np.float32)
 
+    def _load_pixel_frames(self, frame_dir: str):
+        """像素模式：从帧图目录加载帧（按文件名排序），返回 (frames[L,C,H,W], ts[L])。
+
+        帧图目录约定：{frame_dir}/000000.jpg, 000001.jpg, ... 或 .png。
+        时间戳：若存在 {frame_dir}/timestamps.npy 则读取，否则按等间隔 1/fps 生成。
+        """
+        from torchvision import transforms
+        from PIL import Image
+
+        fdir = os.path.join(self.root, frame_dir)
+        exts = (".jpg", ".jpeg", ".png", ".bmp")
+        fnames = sorted(f for f in os.listdir(fdir) if f.lower().endswith(exts))
+        if not fnames:
+            raise FileNotFoundError(f"frame_dir 无帧图: {fdir}")
+
+        transform = transforms.Compose([
+            transforms.Resize((self.cfg.frame_size, self.cfg.frame_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        frames = []
+        for fn in fnames:
+            img = Image.open(os.path.join(fdir, fn)).convert("RGB")
+            frames.append(transform(img))
+        frames = torch.stack(frames)  # (L, C, H, W)
+
+        # 时间戳
+        ts_path = os.path.join(fdir, "timestamps.npy")
+        if os.path.exists(ts_path):
+            ts = np.load(ts_path).astype(np.float32)
+        else:
+            ts = np.arange(len(fnames), dtype=np.float32) / 30.0  # 默认 30fps
+        return frames, ts
+
     def _subsample(self, L: int) -> np.ndarray:
         """超过 max_frames 时均匀抽样索引（保持时间戳真实性）。"""
         if L <= self.cfg.max_frames:
@@ -65,21 +104,62 @@ class VideoTemporalDataset(Dataset):
         return np.linspace(0, L - 1, self.cfg.max_frames).round().astype(int)
 
     def __getitem__(self, i: int) -> dict:
+        """加载单样本。单样本失败时随机替换另一条（错误隔离，不中断训练）。"""
+        try:
+            return self._load_sample(i)
+        except Exception as e:
+            # 错误隔离：随机选另一条（避免递归死循环，最多重试 5 次）
+            for _ in range(5):
+                j = random.randint(0, len(self.rows) - 1)
+                try:
+                    return self._load_sample(j)
+                except Exception:
+                    continue
+            # 全部失败：返回合成占位样本（保证训练不崩）
+            return self._fallback_sample()
+
+    def _load_sample(self, i: int) -> dict:
         r = self.rows[i]
-        feats, ts = self._load_feature(r["feature_ref"])
-        idx = self._subsample(len(ts))
-        feats = torch.from_numpy(feats[idx]).float()          # (L,P,d)
-        ts = torch.from_numpy(ts[idx]).float()                # (L,)
+        if self._pixel and r.get("frame_dir"):
+            frames, ts = self._load_pixel_frames(r["frame_dir"])
+            idx = self._subsample(len(ts))
+            vis = frames[idx]                              # (L,C,H,W)
+            ts = torch.from_numpy(ts[idx]).float()         # (L,)
+        else:
+            feats, ts = self._load_feature(r["feature_ref"])
+            idx = self._subsample(len(ts))
+            vis = torch.from_numpy(feats[idx]).float()     # (L,P,d)
+            ts = torch.from_numpy(ts[idx]).float()         # (L,)
+
+        # 若分词器支持（HFTokenizer），告知当前帧数 Lv 以展开 <video> 占位符（对齐 _scatter_visual）
+        if hasattr(self.tok, "set_video_tokens"):
+            self.tok.set_video_tokens(len(idx))
         ids, labels = self.tok.build_lm_example(r["prompt"], r.get("answer", ""), self.cfg.max_text_len)
-        sample = dict(
-            features=feats, timestamps=ts,
-            input_ids=torch.tensor(ids, dtype=torch.long),
-            labels=torch.tensor(labels, dtype=torch.long),
-        )
+        vkey = "frames" if self._pixel else "features"
+        sample = {
+            vkey: vis, "timestamps": ts,
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
         for k in ("gt_start", "gt_end", "duration", "task_type", "video_id"):
             if k in r:
                 sample[k] = r[k]
         return sample
+
+    def _fallback_sample(self) -> dict:
+        """合成占位样本（所有真实样本均不可用时的最后兜底）。"""
+        L, P, d = 4, self.cfg.feat_patches, self.cfg.feat_dim
+        vkey = "frames" if self._pixel else "features"
+        if self._pixel:
+            vis = torch.zeros(L, 3, self.cfg.frame_size, self.cfg.frame_size)
+        else:
+            vis = torch.zeros(L, P, d)
+        return {
+            vkey: vis,
+            "timestamps": torch.arange(L, dtype=torch.float32),
+            "input_ids": torch.tensor([self.tok.BOS, self.tok.EOS], dtype=torch.long),
+            "labels": torch.tensor([-100, self.tok.EOS], dtype=torch.long),
+        }
 
 
 class SyntheticVideoDataset(Dataset):

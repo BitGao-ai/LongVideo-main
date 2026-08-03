@@ -20,6 +20,7 @@ from ..ops.spectral_init import BranchSpec, DEFAULT_BRANCHES
 from ..modules.spatial_encoder import WindowedSpatialEncoder, FeatureAdapter
 from ..modules.multiscale import MultiScaleEACS
 from ..modules.projector import CrossModalProjector
+from ..modules.cgu import CPIBDistill
 from ..modules.llm_interface import VisualConditionedLM, LLMConfig
 
 
@@ -52,6 +53,19 @@ class CSTSSMConfig:
     mask_ratio: float = 0.15           # stage-1 掩码帧重构比例（设计 §4.4）
     # 可选定位打分头（CSG/VFR 亚帧定位；默认关，开启后随 state_dict 保存/加载）
     grounding_head: bool = False
+    # 创新点1：CPIB-Distill（CGU + Token 蒸馏 + CPI 信号）
+    cpib_distill: bool = False           # 开启后在空间编码与时序建模之间插入 CGU 蒸馏
+    cpib_hidden: int = 256               # CGU MLP 隐藏维
+    cpib_ema_alpha: float = 0.9          # 因果 EMA 衰减系数
+    cpib_context_mode: str = "ema"       # "ema"(默认) | "ssm"(用 EACS 提交状态作为因果上下文)
+    cpi_modulation: float = 0.5          # CPI 对 EventGate 阈值的调制强度（P1.5，0=不启用）
+    # 创新点3：误差有界差分 KV 缓存（推理侧效率）
+    diff_kv: bool = False                # 开启后附带低秩残差预测头（训练时学习重构）
+    diff_kv_rank: int = 8                # 低秩残差秩 r
+    diff_kv_interval: int = 8            # 基准帧间隔 G
+    diff_kv_threshold: float = 0.1       # 残差能量阈值 ε
+    diff_kv_cpi_sparse: bool = True      # 是否启用 CPI 稀疏注意力
+    diff_kv_keep_ratio: float = 0.3      # 高 CPI token 保留比例
 
 
 class CSTSSMModel(nn.Module):
@@ -72,10 +86,27 @@ class CSTSSMModel(nn.Module):
         else:
             self.vision = FeatureAdapter(d_in=cfg.feat_dim, d_out=d)
 
+        # 创新点1：CPIB-Distill（CGU + Token 蒸馏），插入段1与段2之间
+        self.cpib: CPIBDistill | None = None
+        self.cpib_critic = None                             # InfoNCE 双线性 critic
+        if cfg.cpib_distill:
+            # SSM 上下文模式需要状态维度：取第一分支的 H*N*2（实部+虚部）
+            ssm_dim = 0
+            if cfg.cpib_context_mode == "ssm":
+                first_branch = cfg.branches[0]
+                ssm_dim = d * first_branch.n_state * 2  # H=d_model, 复数=2x
+            self.cpib = CPIBDistill(d=d, hidden=cfg.cpib_hidden, ema_alpha=cfg.cpib_ema_alpha,
+                                    context_mode=cfg.cpib_context_mode, ssm_state_dim=ssm_dim)
+            from ..train.contrastive import BilinearCritic
+            self.cpib_critic = BilinearCritic(d)
+
         # 段 2：连续时序建模（EACS 多尺度）
+        gate_kw = dict(init_eps=cfg.gate_init_eps, gate_kind=cfg.eacs_gate_kind)
+        if cfg.cpib_distill and cfg.cpi_modulation > 0:
+            gate_kw["cpi_modulation"] = cfg.cpi_modulation   # P1.5：CPI 贯通 EventGate
         self.temporal = MultiScaleEACS(
             d, branches=cfg.branches,
-            gate_kwargs=dict(init_eps=cfg.gate_init_eps, gate_kind=cfg.eacs_gate_kind),
+            gate_kwargs=gate_kw,
             chunk_size=cfg.eacs_chunk, fused_train=cfg.eacs_fused_train,
             robust_guard=cfg.eacs_robust_guard,
             disc_mode=cfg.eacs_disc_mode, use_spectral_init=cfg.eacs_use_spectral_init)
@@ -97,17 +128,73 @@ class CSTSSMModel(nn.Module):
             from ..modules.grounding_head import GroundingHead
             self.grounding_head = GroundingHead(d_model=d, d_txt=cfg.llm.dim)
 
+        # 创新点3：差分 KV 缓存（推理侧效率，训练时学习低秩重构）+ CPI 稀疏注意力
+        self.diff_kv = None
+        self.cpi_sparse_attn = None
+        if cfg.diff_kv:
+            from ..modules.diff_kv import DifferentialKVCache, DiffKVConfig, CPISparseAttention
+            self.diff_kv = DifferentialKVCache(
+                DiffKVConfig(rank=cfg.diff_kv_rank, base_interval=cfg.diff_kv_interval,
+                             error_threshold=cfg.diff_kv_threshold,
+                             cpi_sparse=cfg.diff_kv_cpi_sparse,
+                             cpi_keep_ratio=cfg.diff_kv_keep_ratio),
+                d_model=d)
+            # CPI 稀疏注意力（因果）：对视觉状态做稀疏压缩后再喂 LLM
+            self.cpi_sparse_attn = CPISparseAttention(
+                d=d, n_heads=8, keep_ratio=cfg.diff_kv_keep_ratio, causal=True)
+
     # ---------- 段 1+2：视觉→时序状态 ----------
     def encode_temporal(self, batch: dict):
         vis_in = batch["features"] if self.cfg.input_mode == "feature" else batch["frames"]
-        feat = self.vision(vis_in)                     # (B,L,d_model)
-        ms = self.temporal(feat, batch["timestamps"], batch.get("frame_mask"))  # MultiScaleOutput
-        return feat, ms
+        cpi_frame, cpi_tokens, tokens = None, None, None
+        ssm_context = None
+        if self.cpib is not None and hasattr(self.vision, "get_tokens"):
+            # CPIB-Distill 路径：token 蒸馏 → 帧级特征 + CPI 信号
+            tokens = self.vision.get_tokens(vis_in)       # (B,L,P,d)
+            # SSM 上下文模式：先跑一次 EACS 获取提交状态，再反馈给 CGU
+            if (self.cpib.context_mode == "ssm" and self.cpib.ssm_ctx is not None):
+                # 第一遍：用 EMA 上下文获取初始 CPI，跑 EACS 得状态
+                feat_ema, cpi_ema, _ = self.cpib(tokens, ssm_context=None)
+                ms_probe = self.temporal(feat_ema, batch["timestamps"], batch.get("frame_mask"),
+                                         cpi=cpi_ema)
+                # 从第一分支提取提交状态 h_pi (B,L,H,N)
+                with torch.no_grad():
+                    _, commits = self.temporal.branches[0].run_with_commits(
+                        self.temporal.branches[0].norm(feat_ema),
+                        batch["timestamps"])
+                ssm_context = self.cpib.project_ssm_states(commits["h"])  # (B,L,d)
+            feat, cpi_frame, cpi_tokens = self.cpib(tokens, ssm_context=ssm_context)
+        else:
+            feat = self.vision(vis_in)                    # (B,L,d_model)
+        ms = self.temporal(feat, batch["timestamps"], batch.get("frame_mask"),
+                           cpi=cpi_frame)  # MultiScaleOutput，CPI 贯通 EventGate
+        return feat, ms, cpi_frame, cpi_tokens, tokens
 
     # ---------- 端到端前向（stage-2 / 推理）----------
     def forward(self, batch: dict) -> dict:
-        feat, ms = self.encode_temporal(batch)
+        feat, ms, cpi_frame, cpi_tokens, tokens = self.encode_temporal(batch)
         visual_states = self.projector(ms.y)           # (B,L,d_llm)
+
+        # 创新点3：CPI 稀疏注意力 + 差分 KV 压缩（训练和推理均启用）
+        if self.cpi_sparse_attn is not None and cpi_frame is not None:
+            # CPI 稀疏注意力：高 CPI 帧走因果全注意力，低 CPI 用摘要替代
+            visual_states = self.cpi_sparse_attn(visual_states, cpi=cpi_frame)
+        if self.diff_kv is not None:
+            # 差分 KV 缓存：训练时计算重构损失，推理时压缩 KV
+            if self.training:
+                # 训练：用 visual_states 作为 K/V 代理，学习低秩重构
+                diff_loss = self.diff_kv.reconstruction_loss(
+                    visual_states.mean(dim=1),  # (B, d) 帧级 K 代理
+                    visual_states.mean(dim=1),  # (B, d) 帧级 V 代理
+                    feat.mean(dim=1) if feat.dim() == 3 else feat)  # (B, d)
+            else:
+                # 推理：逐帧更新差分缓存（显存 O(n)，与时长无关）
+                self.diff_kv.reset()
+                for t in range(visual_states.shape[1]):
+                    self.diff_kv.update(
+                        visual_states[:, t], visual_states[:, t],
+                        feat[:, t] if feat.dim() == 3 else feat, t)
+
         out = self.llm(
             input_ids=batch["input_ids"],
             visual_states=visual_states,
@@ -122,6 +209,14 @@ class CSTSSMModel(nn.Module):
             spectral_reg=self.temporal.spectral_reg(),
             residual=ms.residual,
         )
+        # 创新点3 辅助损失（训练时）
+        if self.diff_kv is not None and self.training:
+            out["diff_kv_loss"] = diff_loss
+        # CPI 信号输出（供创新点1 损失 + P1.5 EventGate 复用）
+        if cpi_frame is not None:
+            out["cpi_frame"] = cpi_frame
+            out["cpi_tokens"] = cpi_tokens
+            out["cpib_tokens_raw"] = tokens       # 原始 token（反事实损失用）
         # 辅助未来预测损失（stage-2 总损失的 L_pred 项，设计 §4.4）
         s = self.cfg.pretrain_horizon
         if feat.shape[1] > s:
@@ -132,31 +227,46 @@ class CSTSSMModel(nn.Module):
     # ---------- stage-1 自监督：未来帧预测 + 掩码帧重构 ----------
     def pretrain_forward(self, batch: dict) -> dict:
         vis_in = batch["features"] if self.cfg.input_mode == "feature" else batch["frames"]
-        feat = self.vision(vis_in)                     # (B,L,d) 完整特征=重构/预测目标
-        B, L, d = feat.shape
-        # 掩码帧：随机把一部分帧输入替换为 mask_token，让模型从时序上下文重构
-        if self.training and self.cfg.mask_ratio > 0 and L > 1:
-            mask = torch.rand(B, L, device=feat.device) < self.cfg.mask_ratio    # (B,L)
-            feat_in = torch.where(mask.unsqueeze(-1), self.mask_token.to(feat.dtype), feat)
+        # 目标特征（重构/预测的 ground-truth）：始终用完整视觉特征
+        feat_target = self.vision(vis_in)               # (B,L,d)
+        B, L, d = feat_target.shape
+        # 输入特征：若启用 CPIB，走 token 蒸馏路径
+        cpi_frame, cpi_tokens, cpib_tokens_raw = None, None, None
+        if self.cpib is not None and hasattr(self.vision, "get_tokens"):
+            tokens = self.vision.get_tokens(vis_in)
+            feat_in, cpi_frame, cpi_tokens = self.cpib(tokens)
+            cpib_tokens_raw = tokens
         else:
-            mask = torch.zeros(B, L, dtype=torch.bool, device=feat.device)
-            feat_in = feat
+            feat_in = feat_target
+        # 掩码帧：随机把一部分帧输入替换为 mask_token，让模型从时序上下文重构
+        # 只在有效帧（frame_mask=True）上掩码，避免 padding 帧成为重构目标
+        valid = batch.get("frame_mask", torch.ones(B, L, dtype=torch.bool, device=feat_in.device))
+        if self.training and self.cfg.mask_ratio > 0 and L > 1:
+            mask = (torch.rand(B, L, device=feat_in.device) < self.cfg.mask_ratio) & valid
+            feat_in = torch.where(mask.unsqueeze(-1), self.mask_token.to(feat_in.dtype), feat_in)
+        else:
+            mask = torch.zeros(B, L, dtype=torch.bool, device=feat_in.device)
         ms = self.temporal(feat_in, batch["timestamps"], batch.get("frame_mask"))
 
         s = self.cfg.pretrain_horizon
         pred = self.pred_head(ms.y)                     # 未来预测
-        pred_loss = (F.mse_loss(pred[:, :-s], feat[:, s:].detach())
+        pred_loss = (F.mse_loss(pred[:, :-s], feat_target[:, s:].detach())
                      if L > s else pred.sum() * 0.0)
         recon = self.recon_head(ms.y)                  # 掩码帧重构
-        recon_loss = (F.mse_loss(recon[mask], feat.detach()[mask])
+        recon_loss = (F.mse_loss(recon[mask], feat_target.detach()[mask])
                       if mask.any() else recon.sum() * 0.0)
-        return {
-            "loss": pred_loss + recon_loss,            # 便捷合计；权重在 losses.pretrain_loss
+        out = {
+            "loss": pred_loss + recon_loss,
             "pred_loss": pred_loss,
             "recon_loss": recon_loss,
             "update_rate": ms.update_rate,
             "spectral_reg": self.temporal.spectral_reg(),
         }
+        if cpi_frame is not None:
+            out["cpi_frame"] = cpi_frame
+            out["cpi_tokens"] = cpi_tokens
+            out["cpib_tokens_raw"] = cpib_tokens_raw
+        return out
 
     # ---------- 定位（连续查询 + query 条件打分头）----------
     def _embed_text(self, input_ids: Tensor) -> Tensor:

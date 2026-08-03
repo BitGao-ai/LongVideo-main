@@ -38,3 +38,16 @@ loss:
   pred: 0.5
   update_rate: 0.1           # 更新率正则（越大越稀疏）
   spectral: 0.05             # 谱防坍缩
+
+data:
+  manifest: null             # 训练 manifest jsonl 路径；null 用合成数据
+  val_manifest: null         # 验证 manifest jsonl；null 跳过验证
+  data_root: ""              # feature_ref 的根目录
+  mode: feature              # feature | pixel
+  max_frames: 512            # 单样本最大帧数（超出均匀抽样）
+  max_text_len: 512          # 文本最大 token 数
+  batch_size: 2              # 生产建议 8~16（配合 grad_accum）
+  num_workers: 0             # 生产建议 8
+  pin_memory: false          # GPU 训练时建议 true
+  persistent_workers: false  # num_workers>0 时建议 true
+  drop_last: false           # 真实数据建议 true

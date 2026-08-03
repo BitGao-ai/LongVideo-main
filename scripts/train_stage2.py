@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--load", default=None, help="从 stage-1 分片检查点热启")
     # 数据加载
     ap.add_argument("--manifest", default=None, help="真实数据 manifest jsonl；缺省用合成数据")
+    ap.add_argument("--val-manifest", default=None, help="验证集 manifest jsonl；缺省跳过验证")
     ap.add_argument("--data-root", default="", help="feature_ref 的根")
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--num-workers", type=int, default=0)
@@ -68,13 +69,22 @@ def main():
                       persistent_workers=args.num_workers > 0,
                       feat_dim=cfg.feat_dim, synth_n=args.steps * args.batch_size + 8)
     loader, ds = build_dataloader(lc)
+    # 验证集（可选）
+    val_loader = None
+    if args.val_manifest:
+        vlc = LoaderConfig(manifest=args.val_manifest, data_root=args.data_root, mode=args.mode,
+                           batch_size=args.batch_size, num_workers=args.num_workers,
+                           shuffle=False, feat_dim=cfg.feat_dim)
+        val_loader, _ = build_dataloader(vlc)
     print(f"[data] {'真实 manifest: %s' % args.manifest if args.manifest else '合成数据'}"
-          f"（{len(ds)} 样本, batch={args.batch_size}, workers={args.num_workers}）")
+          f"（{len(ds)} 样本, batch={args.batch_size}, workers={args.num_workers}）"
+          f"{' + val: %s' % args.val_manifest if args.val_manifest else ''}")
 
     tr = Trainer(model, TrainConfig(stage="finetune", device=args.device, max_steps=args.steps,
-                                    eacs_chunk=16, bf16=(args.device != "cpu"), ckpt_dir=args.ckpt),
+                                    eacs_chunk=16, bf16=(args.device != "cpu"), ckpt_dir=args.ckpt,
+                                    val_every=500 if args.val_manifest else 0),
                  LossWeights(update_rate=0.1, spectral=0.05))
-    tr.fit(cycle(loader))                              # cycle：max_steps 超一个 epoch 也不提前停
+    tr.fit(cycle(loader), val_loader=val_loader)        # cycle：max_steps 超一个 epoch 也不提前停
     tr.save("final")
 
 
