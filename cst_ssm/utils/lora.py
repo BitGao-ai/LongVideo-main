@@ -37,7 +37,10 @@ def _set_submodule(root: nn.Module, name: str, new: nn.Module) -> None:
     setattr(obj, parts[-1], new)
 
 
-_DEFAULT_TARGETS = frozenset({"qkv", "q", "kv", "proj_u", "proj_out", "fusion"})
+# 只针对注意力投影。proj_u / proj_out / fusion 是 EACS 的核心投影，一旦被 LoRA 包住，
+# mark_only_lora_trainable 就会把它们的基座权重冻上、只留 r 秩的旁路——本项目要训的恰恰
+# 是这些时序参数，等于把主干冻死。LLM 段用 apply_lora(model.llm, …) 单独注入。
+_DEFAULT_TARGETS = frozenset({"qkv", "q", "kv"})
 
 
 def apply_lora(model: nn.Module, targets: frozenset = _DEFAULT_TARGETS,

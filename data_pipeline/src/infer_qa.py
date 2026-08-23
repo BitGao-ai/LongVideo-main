@@ -63,18 +63,41 @@ def _make_batch(feats, ts, ids, labels, device="cpu"):
 
 def score_options(model, tok, feats, ts, prompt: str, options, max_len: int = 1024,
                   score_mode: str = "letter", device: str = "cpu"):
-    """对每个选项算似然分数（-loss，越大越可能）。score_mode: letter=打分字母 / text=打分选项原文。"""
+    """对每个选项算似然分数（-loss，越大越可能）。score_mode: letter=打分字母 / text=打分选项原文。
+
+    视觉侧与候选选项无关：若 model 支持 encode_visual（CSTSSMModel），只跑**一次** O(L)
+    的视觉+时序扫描，之后只对 LLM 循环选项；否则回退成逐选项整体前向（兼容注入的 stub）。
+    4–5 个选项 × 四个基准下，这是 4–5 倍的重复扫描。
+    """
     import torch
     n = len(options)
+    answers = [LETTERS[i] if score_mode == "letter" else str(options[i]) for i in range(n)]
+    examples = [build_example(tok, prompt, a, max_len) for a in answers]
+
+    fast = hasattr(model, "encode_visual") and hasattr(model, "llm")
+    if not fast:                                        # 通用回退：逐选项整体前向
+        scores = []
+        for ids, labels in examples:
+            batch = _make_batch(feats, ts, ids, labels, device)
+            with torch.no_grad():
+                out = model(batch)
+            loss = out["loss"] if isinstance(out, dict) else out
+            scores.append(-float(loss))
+        return scores
+
+    # 快路：视觉只算一次
+    probe = _make_batch(feats, ts, examples[0][0], examples[0][1], device)
+    with torch.no_grad():
+        visual_states, _ = model.encode_visual(probe)
     scores = []
-    for i in range(n):
-        answer = LETTERS[i] if score_mode == "letter" else str(options[i])
-        ids, labels = build_example(tok, prompt, answer, max_len)
-        batch = _make_batch(feats, ts, ids, labels, device)
+    for ids, labels in examples:
+        iid = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+        lab = torch.tensor(labels, dtype=torch.long, device=device).unsqueeze(0)
         with torch.no_grad():
-            out = model(batch)
-        loss = out["loss"] if isinstance(out, dict) else out
-        scores.append(-float(loss))
+            out = model.llm(input_ids=iid, visual_states=visual_states,
+                            attention_mask=torch.ones_like(iid, dtype=torch.bool),
+                            visual_mask=probe["frame_mask"], labels=lab)
+        scores.append(-float(out["loss"]))
     return scores
 
 
@@ -91,12 +114,8 @@ def build_default_model(feat_dim: int, d_model: int, ckpt: str | None, device: s
                            llm=LLMConfig(vocab_size=259, dim=128, n_layer=2, n_head=4, max_len=1024))
     model = CSTSSMModel(cfg).to(device).eval()
     if ckpt:
-        if os.path.isdir(ckpt):
-            from cst_ssm.utils import load_sharded
-            model.load_state_dict(load_sharded(ckpt), strict=False)
-        else:
-            sd = torch.load(ckpt, map_location=device)
-            model.load_state_dict(sd.get("model", sd), strict=False)
+        from cst_ssm.utils import load_checkpoint
+        load_checkpoint(model, ckpt, tag="infer_qa")
     return model
 
 

@@ -33,11 +33,9 @@ class Segment:
             return self.duration
         at = at if at is not None else 0.5 * (self.gt_start + self.gt_end)
         # 找到包含 at 的相邻栅格对
-        best = self.duration
         for a, b in zip(g[:-1], g[1:]):
             if a <= at <= b:
                 return b - a
-            best = min(best, b - a) if False else best
         # at 落在网格外：用中位间隔
         diffs = [b - a for a, b in zip(g[:-1], g[1:])]
         diffs.sort()

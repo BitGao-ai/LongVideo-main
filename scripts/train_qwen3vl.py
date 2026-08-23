@@ -55,7 +55,10 @@ def build_model_standin(args):
     model = CSTSSMModel(cfg)
     if args.lora:
         from cst_ssm.utils import apply_lora, mark_only_lora_trainable
-        apply_lora(model, r=args.lora_r, alpha=args.lora_alpha)
+        # 只对 LLM 段注入，与 train_stage2 / train_grounding 对齐：LoRA 的用途是省住
+        # 语言模型的显存，CST-SSM 时序段本来就要全参训练，包上 LoRA 会被
+        # mark_only_lora_trainable 冻住基座。
+        apply_lora(model.llm, r=args.lora_r, alpha=args.lora_alpha)
         mark_only_lora_trainable(model)
     return model
 
@@ -88,9 +91,10 @@ def main():
     ap.add_argument("--data-root", default="", help="feature_ref 的根目录")
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--num-workers", type=int, default=4)
-    ap.add_argument("--max-frames", type=int, default=512)
-    ap.add_argument("--max-text-len", type=int, default=2048)
-    ap.add_argument("--max-video-tokens", type=int, default=512)
+    ap.add_argument("--max-frames", type=int, default=8192)
+    ap.add_argument("--max-text-len", type=int, default=8704)
+    ap.add_argument("--max-video-tokens", type=int, default=8192,
+                    help="必须 ≥ max-frames，否则 video 占位符被截断、尾部帧特征静默丢弃")
     ap.add_argument("--feat-dim", type=int, default=64, help="stand-in 模式特征维")
     # 训练
     ap.add_argument("--stage", default="finetune", choices=["finetune", "pretrain"])
@@ -112,9 +116,10 @@ def main():
     else:
         model = build_model_real(args)
     if args.load:
-        from cst_ssm.utils import load_sharded
+        from cst_ssm.utils import load_checkpoint
         print(f"[model] 热启: {args.load}")
-        model.load_state_dict(load_sharded(args.load), strict=False)
+        # 只热启 CST-SSM 各段是常见用法（LLM 权重来自 HF），故放宽缺失阈值
+        load_checkpoint(model, args.load, max_missing_ratio=0.95, tag="qwen3vl-load")
 
     # ---- 分词器 + 数据 ----
     tokenizer = build_tokenizer(args)
@@ -133,18 +138,42 @@ def main():
         max_frames=args.max_frames, max_text_len=args.max_text_len,
         feat_dim=feat_dim, synth_n=args.steps * args.batch_size + 8)
     loader, ds = build_dataloader(lc, tokenizer=tokenizer)
+    # 防护：真实 manifest + drop_last=True 时，若样本数不足一个 batch，loader 为空（StopIteration）
+    if args.manifest and lc.drop_last and len(ds) < args.batch_size:
+        print(f"[data] 警告: 样本数({len(ds)}) < batch_size({args.batch_size})，"
+              f"drop_last=True 会丢弃所有样本导致 loader 为空；已自动改为 drop_last=False 重建")
+        lc.drop_last = False
+        loader, ds = build_dataloader(lc, tokenizer=tokenizer)
     # 验证集（可选）
     val_loader = None
     if args.val_manifest:
         vlc = LoaderConfig(
             manifest=args.val_manifest, data_root=args.data_root, mode="feature",
             batch_size=args.batch_size, num_workers=args.num_workers,
-            shuffle=False, max_frames=args.max_frames, max_text_len=args.max_text_len,
+            shuffle=False, persistent_workers=args.num_workers > 0,
+            max_frames=args.max_frames, max_text_len=args.max_text_len,
             feat_dim=feat_dim)
         val_loader, _ = build_dataloader(vlc, tokenizer=tokenizer)
     print(f"[data] {'manifest: ' + args.manifest if args.manifest else '合成数据'}"
           f"（{len(ds)} 样本, batch={args.batch_size}）"
           f"{' + val: %s' % args.val_manifest if args.val_manifest else ''}")
+
+    # 关键顺序：CUDA 初始化（Trainer 内 model.to(device)）前先 fork DataLoader worker，
+    # 避免子进程继承 CUDA 上下文导致死锁；persistent_workers 使 worker 保持存活不再重复 fork。
+    if args.num_workers > 0 and args.device != "cpu":
+        print("[data] 预热 DataLoader worker（CUDA 初始化前派生子进程）...")
+        try:
+            _warm = iter(loader)
+            next(_warm)
+            del _warm
+            if val_loader is not None:                  # 验证集同样预热，防止验证阶段再 fork 死锁
+                _warm_v = iter(val_loader)
+                next(_warm_v)
+                del _warm_v
+        except StopIteration:
+            sys.exit(f"[data] 错误: loader 为空，无法预热。请检查 manifest 是否非空、"
+                     f"batch_size({args.batch_size}) 是否超过样本数、特征文件是否可读")
+        print("[data] worker 就绪，首个 batch 加载成功")
 
     # ---- 训练 ----
     from cst_ssm.train import Trainer, TrainConfig, LossWeights

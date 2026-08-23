@@ -18,13 +18,19 @@ from ..ops.scan import selective_scan
 
 
 class ContinuousSSMLayer(nn.Module):
-    """可变 Δt 的连续对角选择性 SSM（pre-LN 残差块）。"""
+    """可变 Δt 的连续对角选择性 SSM（pre-LN 残差块）。
 
-    def __init__(self, d_model: int, spec: BranchSpec, add_residual: bool = True):
+    chunk_size>0 时扫描按块做梯度检查点（数值等价）——并行扫描每层都要保留一份
+    (B,L,H,N) 复数张量，log2(L) 层加起来在 L=1024/H=384/N=64 下是 GB 量级。
+    """
+
+    def __init__(self, d_model: int, spec: BranchSpec, add_residual: bool = True,
+                 chunk_size: int = 0):
         super().__init__()
         self.H = d_model
         self.N = spec.n_state
         self.add_residual = add_residual
+        self.chunk_size = chunk_size
         a_lnr, a_imag = init_branch_lambda(spec, self.H)
         self.a_log_neg_real = nn.Parameter(a_lnr)
         self.a_imag = nn.Parameter(a_imag)
@@ -40,8 +46,11 @@ class ContinuousSSMLayer(nn.Module):
         x_in = x
         xn = self.norm(x)
         u = self.proj_u(xn).float()                                  # (B,L,H)
-        b = self.proj_B(xn); Bc = torch.complex(b[..., :self.N], b[..., self.N:]).to(torch.complex64)
-        c = self.proj_C(xn); Cc = torch.complex(c[..., :self.N], c[..., self.N:]).to(torch.complex64)
+        # autocast(bf16) 下 Linear 输出为 bf16，torch.complex 不支持 bf16，先升精度再组装复数
+        b = self.proj_B(xn).float()
+        Bc = torch.complex(b[..., :self.N], b[..., self.N:])          # complex64
+        c = self.proj_C(xn).float()
+        Cc = torch.complex(c[..., :self.N], c[..., self.N:])          # complex64
         lam = make_lambda(self.a_log_neg_real, self.a_imag).to(torch.complex64)
 
         # 逐步真实 Δt（首帧用次帧间隔兜底）→ 变步长离散化
@@ -52,9 +61,10 @@ class ContinuousSSMLayer(nn.Module):
             dt[:, 0] = dt[:, 1]
         dt_eff = effective_dt(dt.unsqueeze(-1), self.log_dt_scale)   # (B,L,H)
 
-        dA, dB = zoh_discretize(lam, dt_eff, Bc)                     # (B,L,H,N)
+        dA, dB = zoh_discretize(lam, dt_eff, Bc,
+                                inv_lam=torch.reciprocal(lam))       # (B,L,H,N)
         dBu = dB * u.unsqueeze(-1)                                    # 输入注入
-        h = selective_scan(dA, dBu)                                  # ← 变步长扫描（CUDA/PyTorch）
+        h = selective_scan(dA, dBu, chunk=self.chunk_size)           # ← 变步长扫描（CUDA/PyTorch）
         y = torch.einsum("bln,blhn->blh", Cc, h).real + self.D * u   # 读出 + 直连
         y = self.proj_out(y.to(x_in.dtype))
         return x_in + y if self.add_residual else y

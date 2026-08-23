@@ -1,7 +1,9 @@
 # CST-SSM 默认配置（小规模，可在 CPU 跑通；生产按注释放大）
 model:
   input_mode: feature        # feature | pixel
-  feat_dim: 768              # 视觉骨干输出维（feature 模式）；生产常见 768/1024
+  feat_dim: 768              # 视觉骨干输出维（feature 模式）。仅作合成/smoke 的兜底：
+                             # 给了 data.manifest 时，训练脚本会用 align_feat_dim 按真实
+                             # 特征把它校正掉（Qwen3-VL-4B 视觉塔=2560），无需手改。
   d_model: 384               # 时序建模维；生产 768/1024
   gate_init_eps: 0.1         # 事件门控初始阈值
   eacs_chunk: 32             # EACS 分块梯度检查点大小（省显存）；0=关闭
@@ -12,12 +14,26 @@ model:
     - {name: mid,   n_state: 32, tau_min: 10.0, tau_max: 60.0,   imag_scale: 0.3}
     - {name: long,  n_state: 64, tau_min: 600.0, tau_max: 3600.0, imag_scale: 0.1}
   llm:
-    vocab_size: 259          # ByteTokenizer；接真实 LLM 时改为其词表大小
+    # ⚠ 本段只在**未指定 --base-model** 时生效——那条路用自包含的 VisualConditionedLM
+    # （随机初始化的字节级小模型），只能验证训练管线，训不出可用的视频问答模型。
+    # 生产训练请给 train_stage2.py / train_grounding.py 传
+    #   --base-model Qwen/Qwen3-VL-4B-Instruct
+    # 此时 vocab_size / dim 由底座决定并覆盖本段，只有 grad_checkpoint 会被透传。
+    vocab_size: 259          # ByteTokenizer；接真实底座时由其词表大小覆盖
     dim: 512                 # 生产接 7B 时由 HF 模型决定
     n_layer: 6
     n_head: 8
     cross_every: 2           # 每隔几层插入门控交叉注意力
-    max_len: 2048
+    max_len: 8704            # 位置编码长度；须 ≥ data.max_text_len，否则 LLM 前向直接抛错
+    # ---- 显存主开关之二：LLM 段逐层梯度检查点（数值等价，重算换显存）----
+    # CST-SSM 每帧产出 1 个 soft token，故 LLM 序列长度 == 帧数；不开时 LLM 段激活
+    # 随 L 线性增长且是时序段（已被 eacs_chunk 压到 0.057 MB/帧）的数倍，
+    # 是长视频训练真正的天花板。开启后 LLM 段激活约降一个数量级，代价约 +30% 前向。
+    #
+    # 8×40G（当前目标）：必须 true——不开的话 40G 上 B=1 只能吃约 4200 帧。
+    # 8×80G：可改 false 换约 30% 速度，但 batch_size 要相应下调；显存宽裕时
+    #        更划算的用法是保持 true 并把 batch_size 提到 4~8。
+    grad_checkpoint: true
 
 train:
   stage: finetune            # finetune | pretrain
@@ -44,10 +60,18 @@ data:
   val_manifest: null         # 验证 manifest jsonl；null 跳过验证
   data_root: ""              # feature_ref 的根目录
   mode: feature              # feature | pixel
-  max_frames: 512            # 单样本最大帧数（超出均匀抽样）
-  max_text_len: 512          # 文本最大 token 数
+  max_frames: 8192           # 单样本最大帧数（保险丝，非日常预算）；与 SamplerConfig 对齐
+  max_text_len: 8704         # 文本最大 token 数；须 ≥ max_frames + prompt 文本
   batch_size: 2              # 生产建议 8~16（配合 grad_accum）
   num_workers: 0             # 生产建议 8
   pin_memory: false          # GPU 训练时建议 true
   persistent_workers: false  # num_workers>0 时建议 true
   drop_last: false           # 真实数据建议 true
+  # ---- 长度分桶：把长度相近的样本放进同一批，减少 collate 的 padding 浪费 ----
+  # collate 按批内最大帧数 padding；长视频语料 L 方差极大（10min≈600 vs 2h≈4300），
+  # 混批时短样本白占长样本的显存。数值中性：padding 位本就被 frame_mask 掩掉，
+  # 分桶只改变样本的分组方式，不改变任何一个样本的内容。
+  # 自带 DDP 分片（各 rank 不重叠且步数相同），开启后不再叠加 DistributedSampler。
+  length_bucketing: true
+  bucket_multiplier: 32      # megabatch = batch_size×world_size×该值；越大分桶越紧、随机性越弱
+  seed: 0                    # 分桶洗牌种子；DDP 下各 rank 必须一致（同一份 YAML 自然满足）

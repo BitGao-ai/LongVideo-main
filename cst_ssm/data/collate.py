@@ -18,6 +18,17 @@ def collate_fn(batch: list, pad_id: int = 256, pixel: bool = False) -> dict:
 
     # 视觉
     v0 = batch[0][vkey]
+    # 整批按首样本的非时间维开张量，因此除 L 外的形状必须一致（feature 模式下是
+    # patch 数 P 与特征维 d）。不检查的话，下面 vis[i, :L] = b[vkey] 会抛一个只提到
+    # 两个 shape 的底层 RuntimeError，既指不出是哪个样本，也看不出该去改数据集哪一步。
+    for i, b in enumerate(batch):
+        if b[vkey].shape[1:] != v0.shape[1:]:
+            raise ValueError(
+                f"collate_fn: 样本 {i} 的 {vkey} 形状 {tuple(b[vkey].shape[1:])} 与样本 0 的 "
+                f"{tuple(v0.shape[1:])} 不一致（时间维之外必须相同）。"
+                + (f" patch 数 P 不同（{b[vkey].shape[1]} vs {v0.shape[1]}）：抽取时 --patches "
+                   "参数不一致，请统一后重抽或用 validate_dataset.py 排查。"
+                   if not pixel and b[vkey].dim() >= 2 and b[vkey].shape[1] != v0.shape[1] else ""))
     vis = torch.zeros(B, Lmax, *v0.shape[1:], dtype=v0.dtype)
     ts = torch.zeros(B, Lmax)
     frame_mask = torch.zeros(B, Lmax, dtype=torch.bool)
@@ -38,7 +49,7 @@ def collate_fn(batch: list, pad_id: int = 256, pixel: bool = False) -> dict:
         input_ids[i, :T] = b["input_ids"]
         labels[i, :T] = b["labels"]
         attn[i, :T] = True
-        for k in ("gt_start", "gt_end", "duration", "task_type", "video_id"):
+        for k in ("gt_start", "gt_end", "duration", "task_type", "video_id", "row_index"):
             if k in b:
                 extras.setdefault(k, []).append(b[k])
 

@@ -44,7 +44,7 @@ class Qwen3VLLanguageModel(nn.Module):
     """
 
     def __init__(self, hf_model, video_token_id: int | None = None,
-                 train_base: bool = False):
+                 train_base: bool = False, grad_checkpoint: bool = False):
         super().__init__()
         self.hf = hf_model
         # 从 config 读 video_token_id（不同 Qwen3-VL 大小/变体更稳健），回退常量
@@ -54,6 +54,44 @@ class Qwen3VLLanguageModel(nn.Module):
         if not train_base:                              # 默认冻结基座（配合 LoRA）
             for p in self.hf.parameters():
                 p.requires_grad_(False)
+        self.grad_checkpoint = bool(grad_checkpoint)
+        if self.grad_checkpoint:
+            self._enable_grad_checkpoint()
+
+    def _enable_grad_checkpoint(self) -> None:
+        """对 Qwen3-VL 开逐层梯度检查点。数值等价，只用重算换显存。
+
+        两个细节都不是可选项：
+          1) use_reentrant=False —— 可重入实现与 DDP(find_unused_parameters=True) 不兼容，
+             而 Trainer 正是这么配的（CPIB/grounding 是可选模块，不保证每步参与）。
+          2) use_cache=False —— 训练时 KV cache 与检查点互斥，HF 会打印告警并强行关掉；
+             这里提前显式关闭，既免告警也避免白占一份 cache 显存。
+
+        冻结基座（LoRA）下依然需要它：LoRA 挂在各层内部，反向要穿过整个解码器，
+        所有中间激活照样要留——冻结省的是优化器状态，不是激活。
+        """
+        cfg = getattr(self.hf, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cfg.use_cache = False
+        text_cfg = getattr(cfg, "text_config", None)
+        if text_cfg is not None and hasattr(text_cfg, "use_cache"):
+            text_cfg.use_cache = False
+        enable = getattr(self.hf, "gradient_checkpointing_enable", None)
+        if enable is None:
+            raise AttributeError(
+                "该 HF 模型没有 gradient_checkpointing_enable；请升级 transformers，"
+                "或把 llm.grad_checkpoint 设为 false")
+        try:
+            enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            # 老版本 transformers 的签名没有 gradient_checkpointing_kwargs。此时它会走
+            # 可重入实现——与 find_unused_parameters=True 冲突，宁可显式报错也不要在
+            # 8 卡上跑出"某些参数没有梯度"的诡异报错。
+            raise RuntimeError(
+                "当前 transformers 的 gradient_checkpointing_enable 不支持 "
+                "use_reentrant=False（版本过旧）。可重入检查点与 Trainer 的 "
+                "DDP(find_unused_parameters=True) 不兼容，请升级 transformers "
+                "或关闭 llm.grad_checkpoint")
 
     # -- 组件访问（跨 transformers 版本做 getattr 兜底）--
     def _embed_tokens(self):
@@ -72,22 +110,38 @@ class Qwen3VLLanguageModel(nn.Module):
         """把 visual_states 写入 inputs_embeds 中 placeholder_mask 为 True 的位置（行主序对齐）。
 
         约定：每个样本的 video 占位符数量 == 该样本有效视觉状态数（由数据侧保证，见 README）。
+        逐样本强校验该约定：失配时直接 raise——否则视觉状态会跨样本串位写入
+        别的样本的占位符位置，且被全局补零掩盖产生静默错训。
         """
         B, T, d = inputs_embeds.shape
         if visual_mask is not None:
             vis = visual_states[visual_mask]             # (n_valid, d)
+            n_vis_per = visual_mask.sum(dim=1)           # (B,) 逐样本有效状态数
         else:
             vis = visual_states.reshape(-1, d)
-        n_slots = int(placeholder_mask.sum().item())
-        n_vis = vis.shape[0]
+            n_vis_per = torch.full((B,), visual_states.shape[1],
+                                   device=inputs_embeds.device, dtype=torch.long)
+        n_slot_per = placeholder_mask.sum(dim=1)         # (B,) 逐样本占位符数
+        n_slots = int(n_slot_per.sum().item())
         if n_slots == 0:
             return inputs_embeds                          # 无占位符：纯文本
-        if n_vis < n_slots:                               # 数量不足则右侧补零对齐（稳健兜底）
-            vis = torch.cat([vis, vis.new_zeros(n_slots - n_vis, d)], 0)
+        # 校验在**同设备**上做：`n_vis_per.cpu() vs n_slot_per.cpu()` 每步两次 D2H 同步，
+        # 会把整条流水线卡住；只在真的失配时才取回详情。
+        if not bool(torch.equal(n_vis_per, n_slot_per.to(n_vis_per.dtype))):
+            bad = (n_vis_per != n_slot_per).nonzero(as_tuple=True)[0].tolist()
+            ns, nv = n_slot_per.cpu().tolist(), n_vis_per.cpu().tolist()
+            detail = ", ".join(f"样本{i}: 占位符={ns[i]} vs 有效视觉状态={nv[i]}" for i in bad[:8])
+            raise ValueError(
+                "[Qwen3VL] 逐样本 video 占位符数与有效视觉状态数不一致（失配样本："
+                f"{detail}）。请检查数据侧帧数/占位符生成与 max_video_tokens 截断，"
+                "避免视觉状态跨样本串位。")
+        if vis.shape[0] < n_slots:                        # 校验后理论不可达，保留兜底防回归
+            vis = torch.cat([vis, vis.new_zeros(n_slots - vis.shape[0], d)], 0)
         vis = vis[:n_slots].to(inputs_embeds.dtype)
-        out = inputs_embeds.clone()
-        out[placeholder_mask] = vis
-        return out
+        # masked_scatter 直接产出新张量，省掉 clone 那一份 (B,T,d)
+        # （T=2048/d=3584/bf16 时每步 28MB）。inputs_embeds 是 embedding 的输出、
+        # 本就是新张量，不存在改坏调用方数据的风险。
+        return inputs_embeds.masked_scatter(placeholder_mask.unsqueeze(-1), vis)
 
     def forward(self, input_ids: Tensor, visual_states: Tensor,
                 attention_mask: Tensor | None = None,
@@ -125,6 +179,10 @@ class Qwen3VLVisionFeatureExtractor:
     （这正是 CST-SSM 区别于"喂 Δt 给 Mamba"的物理前提）。encode_video(均匀 fps) 仅作 stand-in 保留。
     """
 
+    # 每帧编码 token 数上限（合并后口径）。默认 256 ≈ 512×512 输入，足够池化到 P<=64；
+    # 不设限时 image_processor 会按原分辨率给出数百 token/帧，而下游只保留 P 个 → 算力全浪费。
+    DEFAULT_MAX_FRAME_TOKENS = 256
+
     def __init__(self, hf_model, processor):
         self.hf = hf_model
         self.processor = processor
@@ -134,6 +192,8 @@ class Qwen3VLVisionFeatureExtractor:
         vc = getattr(getattr(hf_model, "config", None), "vision_config", None)
         self._merge = int(getattr(vc, "spatial_merge_size", 2)) if vc else 2
         self._tp = int(getattr(vc, "temporal_patch_size", 2)) if vc else 2
+        self._ps = int(getattr(vc, "patch_size", 16)) if vc else 16
+        self.max_frame_tokens = self.DEFAULT_MAX_FRAME_TOKENS
 
     @classmethod
     def from_pretrained(cls, name: str, **kw):
@@ -144,7 +204,8 @@ class Qwen3VLVisionFeatureExtractor:
 
     @classmethod
     def from_components(cls, visual, processor, spatial_merge_size: int = 2,
-                        temporal_patch_size: int = 2):
+                        temporal_patch_size: int = 2, patch_size: int = 16,
+                        max_frame_tokens: int | None = None):
         """绕过 HF 加载，直接注入视觉塔 + processor（用于测试/高级定制）。"""
         self = cls.__new__(cls)
         self.hf = None
@@ -152,6 +213,9 @@ class Qwen3VLVisionFeatureExtractor:
         self.visual = visual
         self._merge = int(spatial_merge_size)
         self._tp = int(temporal_patch_size)
+        self._ps = int(patch_size)
+        self.max_frame_tokens = (cls.DEFAULT_MAX_FRAME_TOKENS if max_frame_tokens is None
+                                 else int(max_frame_tokens))
         return self
 
     # -------------------- 设备/预处理/池化 内部件 --------------------
@@ -161,14 +225,27 @@ class Qwen3VLVisionFeatureExtractor:
         except Exception:
             return torch.device("cpu")
 
-    def _preprocess_frames(self, frames):
+    def _preprocess_frames(self, frames, max_tokens: int | None = None):
         """把 L 帧 RGB（HxWx3 uint8）过 image_processor → (pixel_values, image_grid_thw)。
 
         以"图像批"路径处理：每帧被 image_processor 内部按 temporal_patch_size 自复制成一个独立
         时间栅格（T=1/帧），故 grid 有 L 行、每行 (1,Hp,Wp)。跨版本用键名兜底。
+
+        max_tokens>0 时给 processor 传 min/max_pixels，把每帧限制到约 max_tokens 个**合并后**
+        token。不限制的话 480×864 的帧会编出 405 token/帧，而我们只留 P(=9) 个——97% 的视觉塔
+        算力白烧，这是抽取阶段最大的一笔无效开销。老版本 processor 不认这两个 kwarg 时自动退回。
         """
         ip = getattr(self.processor, "image_processor", self.processor)
-        enc = ip(images=list(frames), return_tensors="pt")
+        kw = {}
+        if max_tokens and int(max_tokens) > 0:
+            unit = (self._merge * self._ps) ** 2          # 一个合并 token 覆盖的像素数
+            mx = max(int(max_tokens), 4) * unit
+            cur_min = getattr(ip, "min_pixels", None) or unit
+            kw = {"min_pixels": min(int(cur_min), mx), "max_pixels": mx}
+        try:
+            enc = ip(images=list(frames), return_tensors="pt", **kw)
+        except TypeError:                                  # processor 不支持 min/max_pixels
+            enc = ip(images=list(frames), return_tensors="pt")
         pv = enc.get("pixel_values", None) if hasattr(enc, "get") else enc["pixel_values"]
         grid = enc.get("image_grid_thw", None) if hasattr(enc, "get") else enc["image_grid_thw"]
         if pv is None or grid is None:
@@ -176,12 +253,31 @@ class Qwen3VLVisionFeatureExtractor:
         return pv, grid
 
     @staticmethod
-    def _pool_tokens(tok: Tensor, target_P: int) -> Tensor:
+    def _factor_grid(P: int) -> tuple[int, int]:
+        """把目标 patch 数 P 分解成最接近正方的 (gh,gw)：9→3×3，64→8×8，6→2×3，质数→1×P。"""
+        gh = 1
+        for k in range(1, int(P ** 0.5) + 1):
+            if P % k == 0:
+                gh = k
+        return gh, P // gh
+
+    @classmethod
+    def _pool_tokens(cls, tok: Tensor, target_P: int, hw: tuple[int, int] | None = None) -> Tensor:
         """把单帧的 (n,d) 视觉 token 池化到 (target_P,d)。
-        target_P==1 → 全局均值；n==P → 原样；n<P → 循环补齐；n>P → 均匀分组均值（近似空间池化）。"""
+
+        hw=(h',w') 给出该帧**合并后**的 token 网格时走真正的 2D 自适应平均池化：P=9 得到
+        3×3 的空间块。此前用 tensor_split 在展平序列上切 P 段，切点不落在行边界上（405=15×27
+        切 9 段每段 45，而一行 27），产出的是跨行锯齿条带、没有空间语义——那是个实打实的 bug。
+        hw 未知时退回旧的分组均值。
+        """
         n, d = tok.shape
         if target_P == 1:
             return tok.mean(0, keepdim=True)
+        if hw is not None and hw[0] * hw[1] == n:
+            gh, gw = cls._factor_grid(target_P)
+            x = tok.view(1, hw[0], hw[1], d).permute(0, 3, 1, 2).float()   # (1,d,h',w')
+            y = F.adaptive_avg_pool2d(x, (gh, gw))                         # (1,d,gh,gw)
+            return y.permute(0, 2, 3, 1).reshape(gh * gw, d).to(tok.dtype)
         if n == target_P:
             return tok
         if n < target_P:
@@ -190,22 +286,54 @@ class Qwen3VLVisionFeatureExtractor:
         groups = torch.tensor_split(tok, target_P, dim=0)
         return torch.stack([g.mean(0) for g in groups], 0)
 
-    def _segment_and_pool(self, hidden: Tensor, grid_thw: Tensor, target_P: int) -> Tensor:
-        """按 grid 把 (total_tokens,d) 切成逐帧段并各自池化 → (L,target_P,d)。
+    def _align_hidden(self, hidden: Tensor, grid_thw: Tensor):
+        """把视觉塔输出对齐到**空间合并后**的 token 口径 → (hidden, sizes, hw)。
 
-        每帧 token 数 = prod(t,h,w)//merge²（视觉塔空间合并后）。兼容 Qwen 动态分辨率
-        （逐帧 Hp/Wp 可不同），这是相比固定 reshape 的关键稳健性。
+        不同 transformers 版本里 Qwen3VLVisionModel 的返回约定不一致：有的已经过 patch merger
+        （行数 = Σprod/merge²），有的吐 merger 之前的 hidden（行数 = Σprod）。按实际比例判定，
+        后者补跑 self.visual.merger——**必须补跑而不是将就着切**，因为 merger 带 LayerNorm+MLP，
+        正是投影到 LLM 维度 out_hidden_size 的那一步，跳过它存下来的特征维度和语义都跟 LLM 对不上。
         """
-        merge2 = self._merge * self._merge
-        sizes = [int(t) * int(h) * int(w) // merge2 for (t, h, w) in grid_thw.tolist()]
-        if sum(sizes) != int(hidden.shape[0]):
-            raise ValueError(f"token 总数 {int(hidden.shape[0])} 与 grid 推断 {sum(sizes)} 不一致；"
-                             f"检查 spatial_merge_size(={self._merge}) 与视觉塔输出约定")
+        merge = self._merge
+        merge2 = merge * merge
+        g = [(int(t), int(h), int(w)) for (t, h, w) in grid_thw.tolist()]
+        prods = [t * h * w for (t, h, w) in g]
+        total, n = sum(prods), int(hidden.shape[0])
+        if n == total // merge2:
+            pass                                            # 已合并：预期路径
+        elif n == total:
+            merger = getattr(self.visual, "merger", None)
+            if merger is None:
+                raise RuntimeError(
+                    f"视觉塔输出 {n} 个 token = grid patch 总数，说明未做空间合并，"
+                    f"但 self.visual 上找不到 merger 可补跑；请核对 transformers 版本的 "
+                    f"Qwen3VLVisionModel.forward 返回约定")
+            hidden = merger(hidden)
+            if int(hidden.shape[0]) != total // merge2:
+                raise RuntimeError(
+                    f"补跑 merger 后 token 数 {int(hidden.shape[0])} 仍不等于期望 "
+                    f"{total // merge2}（spatial_merge_size={merge}）")
+        else:
+            raise ValueError(
+                f"token 总数 {n} 既不等于 {total // merge2}（已合并）也不等于 {total}（未合并）；"
+                f"spatial_merge_size={merge}，请核对 transformers 版本与视觉塔输出约定")
+        sizes = [p // merge2 for p in prods]
+        # t>1 的栅格（video 路径）一行含多帧，无法当成单张 2D 图池化 → 该行不给 hw
+        hw = [(h // merge, w // merge) if t == 1 else None for (t, h, w) in g]
+        return hidden, sizes, hw
+
+    def _pool_all(self, hidden: Tensor, sizes, hw, target_P: int) -> Tensor:
+        """按 sizes 把 (total_tokens,d) 切成逐帧段并各自池化 → (L,target_P,d)。"""
         out, off = [], 0
-        for s in sizes:
-            out.append(self._pool_tokens(hidden[off:off + s], target_P))
+        for s, g in zip(sizes, hw):
+            out.append(self._pool_tokens(hidden[off:off + s], target_P, g))
             off += s
         return torch.stack(out, 0)
+
+    def _segment_and_pool(self, hidden: Tensor, grid_thw: Tensor, target_P: int) -> Tensor:
+        """对齐 + 逐帧池化的合并入口 → (L,target_P,d)。兼容 Qwen 动态分辨率（逐帧 Hp/Wp 可不同）。"""
+        hidden, sizes, hw = self._align_hidden(hidden, grid_thw)
+        return self._pool_all(hidden, sizes, hw, target_P)
 
     def _run_visual(self, pv: Tensor, grid: Tensor) -> Tensor:
         dev = self._device()
@@ -216,45 +344,62 @@ class Qwen3VLVisionFeatureExtractor:
 
     # ----------------------------- 公开 API -----------------------------
     @torch.no_grad()
-    def encode_frames(self, frames_rgb, timestamps, target_patches: int | None = None):
+    def encode_frames(self, frames_rgb, timestamps, target_patches: int | None = None,
+                      max_tokens_per_frame: int | None = None):
         """L 帧 RGB + 对应真实时间戳 → 帧级特征 [L,P,d] 与 ts[L]（ts 原样返回，不重算）。"""
         import numpy as np
         frames = [np.asarray(f) for f in frames_rgb]
         ts = np.asarray(timestamps, dtype=np.float32)
         if len(frames) != len(ts):
             raise ValueError(f"帧数 {len(frames)} 与时间戳数 {len(ts)} 必须一致")
-        pv, grid = self._preprocess_frames(frames)
+        budget = self.max_frame_tokens if max_tokens_per_frame is None else max_tokens_per_frame
+        pv, grid = self._preprocess_frames(frames, budget)
         hidden = self._run_visual(pv, grid)
-        P = int(target_patches) if target_patches else int(
-            (int(grid[0][1]) * int(grid[0][2])) // (self._merge * self._merge))
-        feats = self._segment_and_pool(hidden, grid, P)          # (L,P,d)
-        return feats.float().cpu().numpy(), ts
+        hidden, sizes, hw = self._align_hidden(hidden, grid)
+        # 默认 P 取各帧最小 token 数（而非 grid[0]）：动态分辨率下逐帧 Hp/Wp 可不同，
+        # 按首帧定 P 会让其余帧被拉伸/截断到一个它们并不具备的分辨率。
+        P = int(target_patches) if target_patches else int(min(sizes))
+        feats = self._pool_all(hidden, sizes, hw, P)             # (L,P,d)
+        # 先 .cpu() 再 .float()：bf16 下 D2H 传输量减半，也免掉 GPU 上那份 float32 副本
+        return feats.cpu().float().numpy(), ts
 
     @staticmethod
-    def _decode_frames(video_path: str, frame_idx):
-        """用 decord 按帧索引**精确随机访问**解码 RGB 帧（只读需要的帧，不整段解码）。"""
-        import numpy as np
+    def make_reader(video_path: str):
+        """建一个持有 decord.VideoReader 的可复用 reader(video_path, frame_idx)->list[HxWx3]。
+
+        分块编码时必须复用：否则每个 chunk 都重新打开视频、重建帧索引（512 帧 / chunk 64 = 8 次）。
+        """
+        import numpy as np  # noqa: F401  (decord 的 asnumpy 依赖)
         try:
             import decord  # type: ignore
         except Exception as e:  # pragma: no cover
             raise ImportError("按 frame_idx 精确取帧需要 decord：pip install decord。原始错误: " + str(e))
         decord.bridge.set_bridge("native")
         vr = decord.VideoReader(video_path)
-        idx = [int(i) for i in frame_idx]
-        batch = vr.get_batch(idx).asnumpy()                      # (L,H,W,3) uint8
-        return [batch[i] for i in range(batch.shape[0])]
+
+        def _read(_path, frame_idx):
+            batch = vr.get_batch([int(i) for i in frame_idx]).asnumpy()   # (L,H,W,3) uint8
+            return [batch[i] for i in range(batch.shape[0])]
+        return _read
+
+    @classmethod
+    def _decode_frames(cls, video_path: str, frame_idx):
+        """用 decord 按帧索引**精确随机访问**解码 RGB 帧（只读需要的帧，不整段解码）。"""
+        return cls.make_reader(video_path)(video_path, frame_idx)
 
     @torch.no_grad()
     def encode_video_at(self, video_path: str, frame_idx, timestamps,
-                        target_patches: int | None = None, reader=None):
+                        target_patches: int | None = None, reader=None,
+                        max_tokens_per_frame: int | None = None):
         """**推荐入口**：按采样器给的 frame_idx 精确取帧过视觉塔。
 
         reader 可注入自定义取帧函数 reader(video_path, frame_idx)->list[HxWx3 uint8]
-        （测试用；默认走 decord）。返回 feats[L,P,d], ts[L]，L==len(frame_idx)，ts==timestamps。
+        （测试用，或分块编码时用 make_reader 复用同一个 VideoReader；默认走 decord）。
+        返回 feats[L,P,d], ts[L]，L==len(frame_idx)，ts==timestamps。
         """
         frames = (reader(video_path, frame_idx) if reader is not None
                   else self._decode_frames(video_path, frame_idx))
-        return self.encode_frames(frames, timestamps, target_patches)
+        return self.encode_frames(frames, timestamps, target_patches, max_tokens_per_frame)
 
     @torch.no_grad()
     def encode_video(self, video_path: str, fps: float = 2.0):
@@ -270,10 +415,11 @@ class Qwen3VLVisionFeatureExtractor:
         pv = inputs["pixel_values_videos"]
         grid = inputs["video_grid_thw"]                          # (num_videos,3)=(T,H,W)
         hidden = self._run_visual(pv, grid)
+        hidden, _, _ = self._align_hidden(hidden, grid)          # 与 encode_frames 同一套对齐
         T, H, W = [int(x) for x in grid[0]]
         P = (H // self._merge) * (W // self._merge)
         d = hidden.shape[-1]
-        feats = hidden[: T * P].reshape(T, P, d).float().cpu().numpy()
+        feats = hidden[: T * P].reshape(T, P, d).cpu().float().numpy()
         ts = (np.arange(T) * self._tp / float(fps)).astype("float32")
         return feats, ts
 
@@ -286,12 +432,23 @@ def build_cstssm_qwen3vl(model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
                          eacs_chunk: int = 32,
                          lora: bool = True,
                          lora_r: int = 16, lora_alpha: int = 32,
-                         dtype=None, **hf_kwargs):
+                         dtype=None, base_cfg=None, grad_checkpoint: bool | None = None,
+                         **hf_kwargs):
     """构建"Qwen3-VL 视觉塔特征 + CST-SSM 时序 + Qwen3-VL LLM"的端到端模型。
 
     返回 CSTSSMModel（feature 模式，feat_dim=视觉塔输出维；LLM 段替换为 Qwen3-VL）。
     数据侧需提供 Qwen3-VL 视觉特征 .npz + prompt 内含 Lv 个 video 占位符（Lv=帧数）。
+
+    base_cfg: 可选的完整 CSTSSMConfig。给了就以它为准，工厂**只接管三个由底座决定的字段**
+        （input_mode / feat_dim / llm），其余一律沿用——包括 cpib_distill、diff_kv、
+        eacs_gate_kind、eacs_disc_mode、cpi_modulation 等全部消融开关，此时
+        d_model / branches / gate_init_eps / eacs_chunk 这几个形参被忽略（值取自 base_cfg）。
+
+        这个参数是必要的：这些开关都在 CSTSSMModel.__init__ 里生效，调用方拿到模型后再改
+        cfg 不会重建任何模块。消融脚本此前正是那样写的，导致 --real 路径下各臂完全相同。
+        构造完请用 models.assert_config_applied(model, cfg) 核对一次。
     """
+    from dataclasses import replace
     from ..ops.spectral_init import DEFAULT_BRANCHES
     from ..modules.llm_interface import LLMConfig
     from ..models.cst_ssm_model import CSTSSMModel, CSTSSMConfig
@@ -302,15 +459,24 @@ def build_cstssm_qwen3vl(model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
         model_name, **({"torch_dtype": dtype} if dtype else {}), **hf_kwargs)
     hidden = hf.config.text_config.hidden_size
     feat_dim = getattr(hf.config.vision_config, "out_hidden_size", QWEN3VL_OUT_HIDDEN)
+    # LLMConfig 仅用于 projector 目标维（=Qwen hidden）；实际 LLM 用 Qwen3-VL。
+    # grad_checkpoint 必须从 base_cfg.llm 透传：这里是新建 LLMConfig，不带过来的话
+    # YAML 里的 model.llm.grad_checkpoint 会被这一行悄悄丢掉（改配置无效果）。
+    _gc = bool(getattr(getattr(base_cfg, "llm", None), "grad_checkpoint", False))
+    if grad_checkpoint is not None:                 # 显式形参优先于 base_cfg
+        _gc = bool(grad_checkpoint)
+    llm_cfg = LLMConfig(vocab_size=hf.config.text_config.vocab_size, dim=hidden,
+                        grad_checkpoint=_gc)
 
-    cfg = CSTSSMConfig(
-        input_mode="feature", feat_dim=feat_dim, d_model=d_model,
-        branches=branches or DEFAULT_BRANCHES, gate_init_eps=gate_init_eps,
-        eacs_chunk=eacs_chunk,
-        # LLMConfig 仅用于 projector 目标维（=Qwen hidden）；实际 LLM 用 Qwen3-VL
-        llm=LLMConfig(vocab_size=hf.config.text_config.vocab_size, dim=hidden),
-    )
-    qwen_llm = Qwen3VLLanguageModel(hf, train_base=not lora)   # video_token_id 从 hf.config 读
+    if base_cfg is not None:
+        cfg = replace(base_cfg, input_mode="feature", feat_dim=feat_dim, llm=llm_cfg)
+    else:
+        cfg = CSTSSMConfig(
+            input_mode="feature", feat_dim=feat_dim, d_model=d_model,
+            branches=branches or DEFAULT_BRANCHES, gate_init_eps=gate_init_eps,
+            eacs_chunk=eacs_chunk, llm=llm_cfg)
+
+    qwen_llm = Qwen3VLLanguageModel(hf, train_base=not lora, grad_checkpoint=_gc)
     model = CSTSSMModel(cfg, llm=qwen_llm)               # 视觉走特征缓存，故不注入 vision
 
     if lora:

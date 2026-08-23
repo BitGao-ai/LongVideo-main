@@ -45,6 +45,8 @@ class VideoTemporalDataset(Dataset):
         with open(cfg.manifest) as f:
             self.rows = [json.loads(l) for l in f if l.strip()]
         self._pixel = (cfg.mode == "pixel")
+        self._n_fail = 0        # 取样失败次数（含被成功替换的）
+        self._n_fallback = 0    # 返回零特征占位样本的次数
 
     def __len__(self):
         return len(self.rows)
@@ -104,10 +106,17 @@ class VideoTemporalDataset(Dataset):
         return np.linspace(0, L - 1, self.cfg.max_frames).round().astype(int)
 
     def __getitem__(self, i: int) -> dict:
-        """加载单样本。单样本失败时随机替换另一条（错误隔离，不中断训练）。"""
+        """加载单样本。单样本失败时随机替换另一条（错误隔离，不中断训练）。
+
+        **失败是可见的**：每次替换/兜底都计数，首次出现时告警，之后按指数间隔提示总量。
+        静默吞掉异常会让"特征路径写错 / npz 损坏 / 维度不匹配"这类问题在训练与评测里
+        完全不留痕迹——loss 曲线照样漂亮、准确率照样有数，但跑的其实是零特征。
+        """
         try:
             return self._load_sample(i)
         except Exception as e:
+            self._n_fail += 1
+            self._report_fail(i, e)
             # 错误隔离：随机选另一条（避免递归死循环，最多重试 5 次）
             for _ in range(5):
                 j = random.randint(0, len(self.rows) - 1)
@@ -116,7 +125,25 @@ class VideoTemporalDataset(Dataset):
                 except Exception:
                     continue
             # 全部失败：返回合成占位样本（保证训练不崩）
+            self._n_fallback += 1
+            if self._n_fallback == 1:
+                print(f"[dataset] 严重告警: 连续 6 次取样失败，返回**零特征占位样本**。"
+                      f"此后的指标不可信，请先修数据。首个错误: {type(e).__name__}: {e}")
             return self._fallback_sample()
+
+    def _report_fail(self, i: int, e: Exception) -> None:
+        """按 1,2,4,8,… 的间隔告警，既不刷屏也不静默。"""
+        n = self._n_fail
+        if n & (n - 1) == 0:      # n 是 2 的幂
+            ratio = n / max(len(self.rows), 1)
+            print(f"[dataset] 警告: 第 {n} 次取样失败（占清单 {ratio:.1%}），"
+                  f"行 {i} video_id={self.rows[i].get('video_id')!r}: {type(e).__name__}: {e}")
+
+    @property
+    def failure_stats(self) -> dict:
+        """取样失败统计。评测脚本应在收尾时检查，failures>0 意味着指标含替换样本。"""
+        return {"failures": self._n_fail, "fallbacks": self._n_fallback,
+                "total_rows": len(self.rows)}
 
     def _load_sample(self, i: int) -> dict:
         r = self.rows[i]
@@ -140,6 +167,10 @@ class VideoTemporalDataset(Dataset):
             vkey: vis, "timestamps": ts,
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
+            # 样本真实对应的 manifest 行号。__getitem__ 失败时会替换成别的行，
+            # 下游评测若按 batch 顺序推算行号就会静默错位（拿 A 的预测配 B 的答案），
+            # 因此把行号跟着样本一起传出去，由 collate 透传给评测脚本。
+            "row_index": i,
         }
         for k in ("gt_start", "gt_end", "duration", "task_type", "video_id"):
             if k in r:
@@ -159,6 +190,7 @@ class VideoTemporalDataset(Dataset):
             "timestamps": torch.arange(L, dtype=torch.float32),
             "input_ids": torch.tensor([self.tok.BOS, self.tok.EOS], dtype=torch.long),
             "labels": torch.tensor([-100, self.tok.EOS], dtype=torch.long),
+            "row_index": -1,          # -1 = 占位样本，不对应任何 manifest 行
         }
 
 

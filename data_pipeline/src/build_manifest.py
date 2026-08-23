@@ -82,6 +82,9 @@ def run(args):
                 sample = dict(
                     video_id=vid,
                     feature_ref=ref,
+                    # 帧数写进 manifest：长度分桶采样器（cst_ssm/data/bucketing.py）需要它，
+                    # 否则每次启动都要逐个探测特征文件头。纯元数据，不影响任何下游语义。
+                    n_frames=int(L),
                     prompt=build_prompt(r.get("question", r.get("prompt", "")),
                                         L, args.placeholder_mode, args.max_frames),
                     answer=build_answer(r, task),
@@ -107,7 +110,9 @@ def main():
     ap.add_argument("--data-root", default="data", help="feature_ref 相对此根")
     ap.add_argument("--task", default="qa", choices=["qa", "caption", "grounding", "causal"])
     ap.add_argument("--placeholder-mode", default="single", choices=["single", "expand"])
-    ap.add_argument("--max-frames", type=int, default=512, help="expand 模式对齐 subsample")
+    ap.add_argument("--max-frames", type=int, default=8192,
+                    help="expand 模式对齐 subsample；必须与 DataConfig.max_frames 一致，"
+                         "否则 expand 出的占位符数 min(L,max_frames) 与实际帧数对不上")
     ap.add_argument("--split", default="train")
     ap.add_argument("--prefer-npy", action="store_true", help="优先读 .npy（否则 .npz）")
     ap.add_argument("--require-qa", action="store_true", help="无 QA 的特征跳过")

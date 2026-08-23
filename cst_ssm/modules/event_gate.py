@@ -99,20 +99,27 @@ class EventGate(nn.Module):
 
     def forward(self, obs: Tensor, pred: Tensor,
                 eps_override: Tensor | None = None,
-                cpi: Tensor | None = None) -> tuple[Tensor, Tensor]:
+                cpi: Tensor | None = None,
+                temp_override: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """返回 (gate, r)。gate∈[0,1]（软，训练）或∈{0,1}（硬，推理/STE 前向）。
         eps_override：可选逐样本阈值（鲁棒兖底用），覆盖 self.eps。
-        cpi：可选帧级 CPI 信号 (B,)，调制阈值（P1.5 统一主线）。"""
+        cpi：可选帧级 CPI 信号 (B,)，调制阈值（P1.5 统一主线）。
+        temp_override：可选温度，覆盖 self.temperature。多分支并轴扫描时由调用方传各分支
+            堆叠后的 (S,) 温度——否则并轴就得先断言各分支温度相等，而那是一次 GPU→CPU
+            同步（N8 修的正是同一类开销）。"""
         r = self.residual(obs, pred)                    # (…,)
         if self.gate_kind == "always":                  # 消融：稠密（无门控）
             return torch.ones_like(r), r
         if self.gate_kind == "random":                  # 消融：随机跳更新（对照残差驱动）
             return (torch.rand_like(r) < self.random_rate).to(r.dtype), r
         eps = self.eps if eps_override is None else eps_override
-        # CPI 调制：高 CPI → 降低 ε → 更易触发更新（设计 §2.2 统一主线）
+        # CPI 调制：高 CPI → 降低 ε → 更易触发更新（设计 §2.2 统一主线）。
+        # clamp_min 保护：cpi_modulation 接近 1 且 cpi≈1 时 ε 会退化到≈0（任何残差都触发更新，
+        # 事件门控退化为稠密更新），下界保底门控仍有区分度。
         if cpi is not None and self.cpi_modulation > 0:
-            eps = eps * (1.0 - self.cpi_modulation * cpi.clamp(0, 1))
-        soft = torch.sigmoid((r - eps) / self.temperature.clamp_min(1e-4))
+            eps = (eps * (1.0 - self.cpi_modulation * cpi.clamp(0, 1))).clamp_min(1e-3)
+        temp = self.temperature if temp_override is None else temp_override
+        soft = torch.sigmoid((r - eps) / temp.clamp_min(1e-4))
         if not self.training:
             return (r > eps).to(r.dtype), r
         if self.use_ste:

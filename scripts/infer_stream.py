@@ -40,8 +40,9 @@ def main():
     print(f"{'内容冗余度':>10} | {'整体更新率':>10} | 各分支(短/中/长)更新率")
     for red in (0.1, 0.5, 0.9, 0.99):
         feats, ts = make_video(args.frames, 4, cfg.feat_dim, red, args.device)
-        x = model.vision(feats)
+        # 推理全程无梯度：vision 前向也包在 no_grad 内，避免长序列激活无谓驻留内存
         with torch.no_grad():
+            x = model.vision(feats)
             ms = model.temporal(x, ts)
         pbur = [f"{v.item():.3f}" for v in ms.per_branch_update_rate]
         print(f"{red:>10.2f} | {ms.update_rate.item():>10.3f} | {' / '.join(pbur)}")

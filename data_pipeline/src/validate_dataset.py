@@ -34,16 +34,35 @@ def count_video_tokens(prompt: str) -> int:
     return prompt.count("<video>")
 
 
-def check_row(r: dict, root: str, cfg: dict) -> list:
-    """返回该行的错误列表（空=通过）。软告警以 'WARN:' 前缀。"""
+def _infer_feat_dim(rows: list, root: str):
+    """从首个可读特征推断 d（与训练脚本 infer_feat_dim 同策略）；全部不可达返回 None。
+    不同模型视觉塔输出维不同（如 Qwen3-VL-4B=2560、更大变体=3584），写死期望维会误报。"""
+    for r in rows:
+        ref = r.get("feature_ref")
+        if not ref:
+            continue
+        try:
+            feats, _ = _load_feat_ts(ref, root)
+            return int(feats.shape[-1])
+        except Exception:
+            continue
+    return None
+
+
+def check_row(r: dict, root: str, cfg: dict) -> tuple[list, int | None]:
+    """返回 (该行的错误列表, 特征维)。空错误列表=通过；软告警以 'WARN:' 前缀。
+
+    维度一并返回，避免外层为了收集 dims 再把 .npz 整载解压一遍
+    （.npz 是 zip 归档、mmap 无效，数十万样本上这是实打实的两倍 IO）。
+    """
     errs = []
     ref = r.get("feature_ref")
     if not ref:
-        return ["missing feature_ref"]
+        return ["missing feature_ref"], None
     try:
         feats, ts = _load_feat_ts(ref, root)                 # ④ 可达可载
     except Exception as e:
-        return [f"unreachable feature_ref: {e}"]
+        return [f"unreachable feature_ref: {e}"], None
 
     L = int(feats.shape[0]); d = int(feats.shape[-1])
 
@@ -81,15 +100,25 @@ def check_row(r: dict, root: str, cfg: dict) -> list:
         dur = float(r.get("duration", ts[-1] if len(ts) else 0))
         if float(r["gt_end"]) > dur + 1e-3 or float(r.get("gt_start", 0)) < -1e-3:
             errs.append(f"WARN: grounding 标注越界 [{r.get('gt_start')},{r['gt_end']}] vs dur {dur}")
-    return errs
+    return errs, d
 
 
 def run(args, cfg: dict):
     rows = [json.loads(l) for l in open(args.manifest) if l.strip()]
+    if cfg["check_dim_consistency"] and cfg["feat_dim"] is None:
+        d = _infer_feat_dim(rows, args.data_root)
+        if d is None:
+            print("[validate] 未指定 --feat-dim 且无法从特征推断维度（全部不可达？），跳过维度检查")
+            cfg["check_dim_consistency"] = False
+        else:
+            cfg["feat_dim"] = d
+            print(f"[validate] 未指定 --feat-dim：从特征自动推断期望维={d}（不同模型视觉塔输出维不同，"
+                  f"如需强约束请显式传 --feat-dim）")
     n_err = n_warn = 0
     dims = set()
     for i, r in enumerate(rows):
-        for e in check_row(r, args.data_root, cfg):
+        errs, dim = check_row(r, args.data_root, cfg)     # 一次加载，同时拿错误与维度
+        for e in errs:
             if e.startswith("WARN:"):
                 n_warn += 1
                 if args.verbose:
@@ -97,12 +126,8 @@ def run(args, cfg: dict):
             else:
                 n_err += 1
                 print(f"  [ERR ] 行{i} {r.get('video_id')}: {e}")
-        # 收集维度一致性（跨行）
-        try:
-            f, _ = _load_feat_ts(r["feature_ref"], args.data_root)
-            dims.add(int(f.shape[-1]))
-        except Exception:
-            pass
+        if dim is not None:
+            dims.add(dim)
 
     print(f"[validate] 共 {len(rows)} 行：错误 {n_err}，告警 {n_warn}")
     if len(dims) > 1:
@@ -117,7 +142,7 @@ def run(args, cfg: dict):
 
 DEFAULTS = dict(check_monotonic_ts=True, check_placeholder_align=True,
                 check_dim_consistency=True, warn_constant_dt=True,
-                placeholder_mode="single", max_frames=512, feat_dim=3584, strict=True)
+                placeholder_mode="single", max_frames=8192, feat_dim=None, strict=True)
 
 
 def main():
@@ -125,8 +150,10 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--data-root", default="data")
     ap.add_argument("--placeholder-mode", default="single", choices=["single", "expand"])
-    ap.add_argument("--max-frames", type=int, default=512)
-    ap.add_argument("--feat-dim", type=int, default=3584)
+    ap.add_argument("--max-frames", type=int, default=8192,
+                    help="expand 模式下校验占位符数 == min(L,max_frames)；须与 DataConfig 一致")
+    ap.add_argument("--feat-dim", type=int, default=None,
+                    help="期望特征维；缺省自动从特征文件推断（不同模型不同：如 Qwen3-VL-4B=2560）")
     ap.add_argument("--strict", action="store_true", help="有硬错误即非零退出")
     ap.add_argument("--verbose", action="store_true", help="打印软告警明细")
     a = ap.parse_args()

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -15,6 +16,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from .losses import LossWeights, finetune_loss, pretrain_loss
+from ..modules.eacs import EACSLayer
 from ..utils.memory import (set_eacs_chunk, set_gate_temperature, autocast_ctx,
                             build_optimizer, gate_temperature_schedule,
                             set_eps_anneal, eps_anneal_schedule)
@@ -47,7 +49,11 @@ class TrainConfig:
     grad_clip: float = 1.0
     bf16: bool = True
     device: str = "cuda"
-    eacs_chunk: int = 0              # >0 启用 EACS 分块梯度检查点
+    # EACS 分块梯度检查点。None（默认）= **沿用模型自身的 CSTSSMConfig.eacs_chunk**，
+    # 不做任何干预；显式给 int 才覆盖（0=强制关闭，>0=强制开启并指定块大小）。
+    # 早期这里默认 0 且无条件覆盖，会把 CSTSSMConfig/YAML 里配好的 chunk 静默清零，
+    # 导致省显存开关看似打开、实际从未生效（实测 985MB → 60MB 的差别）。
+    eacs_chunk: int | None = None
     log_every: int = 10
     ckpt_every: int = 0             # >0 周期保存
     ckpt_dir: str = "checkpoints"
@@ -73,7 +79,7 @@ class Trainer:
         self.weights = weights or LossWeights()
         self.step = 0
 
-        # DDP 初始化（P3）
+        # DDP 初始化（P3）‰
         self._ddp_model = None
         if cfg.ddp:
             if not is_distributed():
@@ -90,7 +96,17 @@ class Trainer:
             self.model = model.to(device)
             cfg.device = device
 
-        set_eacs_chunk(self.model, cfg.eacs_chunk)
+        # 分块梯度检查点：仅在显式指定时覆盖模型自身配置；无论哪条路径都把最终生效值
+        # 打出来，避免"以为开了其实没开"（省显存开关必须可见）。
+        if cfg.eacs_chunk is not None:
+            set_eacs_chunk(self.model, cfg.eacs_chunk)
+        if is_main_process():
+            chunks = sorted({m.chunk_size for m in self.model.modules()
+                             if isinstance(m, EACSLayer)})
+            if chunks:
+                src = "TrainConfig" if cfg.eacs_chunk is not None else "模型配置"
+                state = "关闭" if chunks == [0] else f"块大小={chunks[0] if len(chunks) == 1 else chunks}"
+                print(f"[train] EACS 分块梯度检查点: {state}（来自 {src}）")
         self.opt = build_optimizer(self.model, cfg.lr, cfg.weight_decay)
 
     @property
@@ -109,18 +125,24 @@ class Trainer:
         # ε 退火（默认 start=end=1.0 即无退火）
         set_eps_anneal(self.model, eps_anneal_schedule(
             self.step, cfg.max_steps, cfg.eps_anneal_start, cfg.eps_anneal_end))
-        with autocast_ctx(cfg.bf16, device_type=("cuda" if "cuda" in cfg.device else "cpu")):
+        # DDP 梯度累积：非同步步跳过 all-reduce（no_sync），只在真正 step 时同步一次，
+        # 否则每个微批都通信，多卡梯度累积效率大打折扣。
+        grad_sync_ctx = nullcontext()
+        if (self._ddp_model is not None
+                and (self.step + 1) % cfg.grad_accum != 0):
+            grad_sync_ctx = self._ddp_model.no_sync()
+        with autocast_ctx(cfg.bf16, device_type=("cuda" if "cuda" in cfg.device else "cpu")), grad_sync_ctx:
+            # 统一走 forward(batch, stage=...)：DDP 只有经 DDP.forward 才会挂上梯度同步 hook，
+            # 直接调 pretrain_forward/grounding_forward 既会 AttributeError，绕过后又会静默丢同步。
+            out = fwd_model(batch, stage=cfg.stage)
             if cfg.stage == "pretrain":
-                out = fwd_model.pretrain_forward(batch)
                 loss, comp = pretrain_loss(out, self.weights, model=self.model, step=self.step)
             elif cfg.stage == "grounding":
-                out = fwd_model.grounding_forward(batch)
                 loss = out["loss"]
                 comp = {"grounding": out["grounding_loss"], "total": out["loss"].detach()}
             else:
-                out = fwd_model(batch)
                 loss, comp = finetune_loss(out, self.weights, model=self.model, step=self.step)
-        (loss / cfg.grad_accum).backward()
+            (loss / cfg.grad_accum).backward()
         if (self.step + 1) % cfg.grad_accum == 0:
             if cfg.grad_clip:
                 nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad],
@@ -150,27 +172,38 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, val_loader: Iterable[dict]) -> dict:
-        """在验证集上跑 val_steps 个 batch，返回平均 loss 组件。"""
+        """在验证集上跑 val_steps 个 batch，返回平均 loss 组件。
+
+        进出的 train/eval 模式必须守恒：此前结束时无条件 .train()，评测脚本只要在推理
+        循环里插一次 validate，之后的推理就会跑在 train 模式下——EACS 走软门控、
+        RunningStandardizer 继续更新统计、门控温度语义改变，指标静默偏移且不报错。
+        """
         fwd_model = self._forward_model
+        was_training = fwd_model.training
         fwd_model.eval()
         accum: dict[str, list] = {}
         n = 0
-        for batch in val_loader:
-            if n >= self.cfg.val_steps:
-                break
-            batch = move_to(batch, self.cfg.device)
-            with autocast_ctx(self.cfg.bf16, device_type=("cuda" if "cuda" in self.cfg.device else "cpu")):
-                if self.cfg.stage == "pretrain":
-                    out = fwd_model.pretrain_forward(batch)
-                    _, comp = pretrain_loss(out, self.weights, model=self.model, step=self.step)
-                else:
-                    out = fwd_model(batch)
-                    _, comp = finetune_loss(out, self.weights, model=self.model, step=self.step)
-            for k, v in comp.items():
-                val = v.item() if torch.is_tensor(v) else float(v)
-                accum.setdefault(k, []).append(val)
-            n += 1
-        fwd_model.train()
+        try:
+            for batch in val_loader:
+                if n >= self.cfg.val_steps:
+                    break
+                batch = move_to(batch, self.cfg.device)
+                with autocast_ctx(self.cfg.bf16, device_type=("cuda" if "cuda" in self.cfg.device else "cpu")):
+                    out = fwd_model(batch, stage=self.cfg.stage)
+                    if self.cfg.stage == "pretrain":
+                        _, comp = pretrain_loss(out, self.weights, model=self.model, step=self.step)
+                    elif self.cfg.stage == "grounding":
+                        # 与 train_step 对齐：grounding 阶段必须走 grounding_forward，
+                        # 否则会拿 QA 前向算 BCE 组件（输出无 grounding_loss 且语义错误）
+                        comp = {"grounding": out["grounding_loss"], "total": out["loss"].detach()}
+                    else:
+                        _, comp = finetune_loss(out, self.weights, model=self.model, step=self.step)
+                for k, v in comp.items():
+                    val = v.item() if torch.is_tensor(v) else float(v)
+                    accum.setdefault(k, []).append(val)
+                n += 1
+        finally:
+            fwd_model.train(was_training)
         return {k: sum(vs) / len(vs) for k, vs in accum.items()}
 
     def save(self, tag: str) -> str:

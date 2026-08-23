@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 
 # --------------------------- 低耦合协议 ---------------------------
@@ -31,6 +32,19 @@ class LLMBackbone(Protocol):
 
 
 # --------------------------- 模块 ---------------------------
+def _safe_softmax(attn: Tensor, dim: int = -1) -> Tensor:
+    """softmax，但"整行 key 都被遮蔽"时输出全 0 而不是 NaN。
+
+    全 -inf 行的 softmax 是 0/0 → NaN，会顺着反传把整个梯度污染成 NaN，且没有任何报错。
+    触发条件很现实：某个样本的 visual_mask 全 False（整段视频都是 padding）、
+    或外部注入的 attention_mask 把某个 query 位置的全部 key 都挡掉。
+    这类行本就没有可见的 key，输出 0（对残差不做贡献）是唯一有意义的取值。
+    """
+    visible = torch.isfinite(attn).any(dim=dim, keepdim=True)
+    w = attn.masked_fill(~visible, 0.0).softmax(dim)   # 先避开 0/0
+    return w * visible                                 # 再把这些行整体归零
+
+
 class GatedCrossAttention(nn.Module):
     """文本查询 → 视觉状态键/值的门控交叉注意力。tanh 门初始 0，保证初始不改变 LLM 行为。"""
 
@@ -55,7 +69,7 @@ class GatedCrossAttention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale  # (B,heads,Lt,Lv)
         if visual_mask is not None:
             attn = attn.masked_fill(~visual_mask[:, None, None, :], float("-inf"))
-        attn = attn.softmax(-1)
+        attn = _safe_softmax(attn)
         out = (attn @ v).transpose(1, 2).reshape(B, Lt, d)
         return text + torch.tanh(self.gate) * self.proj(out)
 
@@ -77,7 +91,7 @@ class _CausalSelfAttn(nn.Module):
         attn = attn.masked_fill(causal, float("-inf"))
         if key_padding_mask is not None:                # (B,T) True=有效
             attn = attn.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
-        attn = attn.softmax(-1)
+        attn = _safe_softmax(attn)
         out = (attn @ v).transpose(1, 2).reshape(B, T, d)
         return self.proj(out)
 
@@ -105,6 +119,17 @@ class LLMConfig:
     n_head: int = 8
     cross_every: int = 2       # 每隔多少层插入一次门控交叉注意力
     max_len: int = 2048
+    # LLM 段逐层梯度检查点。与 CSTSSMConfig.eacs_chunk 同性质：**数值上逐位等价**，
+    # 只用重算换显存（反向时重跑一遍层内前向，约 +30% 前向计算）。
+    #
+    # 为什么长视频必须有它：CST-SSM 每帧产出 1 个 soft token（cst_ssm_model.py 的
+    # encode_visual），所以 LLM 序列长度 == 帧数。不开检查点时 LLM 段每 token 要留
+    # n_layer × O(hidden) 的激活，L=4000 时它是 CST-SSM 段（已被 eacs_chunk 压到
+    # 0.057 MB/帧）的数倍——真正的长视频显存天花板在这里，不在时序段。
+    #
+    # 实现固定用 use_reentrant=False，原因见 VisualConditionedLM.forward 的注释：
+    # 可重入版本与 DDP(find_unused_parameters=True) 不兼容，而 Trainer 正是这么配的。
+    grad_checkpoint: bool = False
 
 
 class VisualConditionedLM(nn.Module):
@@ -124,16 +149,35 @@ class VisualConditionedLM(nn.Module):
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight            # 权重绑定省显存
 
+    def _maybe_ckpt(self, module, *args):
+        """按 cfg.grad_checkpoint 决定是否对一层做梯度检查点。
+
+        只在**训练且梯度开启**时启用：推理下 checkpoint 既省不到显存（本就没有反向图），
+        还会因"没有输入 requires_grad"而告警。
+
+        use_reentrant=False 是硬性要求而非偏好：可重入实现要求 DDP 关闭
+        find_unused_parameters 并开 static_graph，而 Trainer 用的是
+        find_unused_parameters=True（CPIB/grounding 属可选模块，不是每步都参与）。
+        非重入版本与该配置兼容，且同样保留 RNG 状态（dropout 等随机层数值不变）。
+        """
+        if not (self.cfg.grad_checkpoint and self.training and torch.is_grad_enabled()):
+            return module(*args)
+        return checkpoint(module, *args, use_reentrant=False)
+
     def forward(self, input_ids: Tensor, visual_states: Tensor,
                 attention_mask: Tensor | None = None,
                 visual_mask: Tensor | None = None,
                 labels: Tensor | None = None) -> dict:
         B, T = input_ids.shape
+        if T > self.cfg.max_len:
+            raise ValueError(
+                f"文本长度 T={T} 超过 LLMConfig.max_len={self.cfg.max_len}（位置编码只有这么长）。"
+                f"请调大 max_len，或把数据侧的 max_text_len 降到 ≤{self.cfg.max_len}。")
         h = self.embed(input_ids) + self.pos[:, :T]
         for i, layer in enumerate(self.layers):
-            h = layer(h, attention_mask)
+            h = self._maybe_ckpt(layer, h, attention_mask)
             if str(i) in self.cross:
-                h = self.cross[str(i)](h, visual_states, visual_mask)
+                h = self._maybe_ckpt(self.cross[str(i)], h, visual_states, visual_mask)
         h = self.norm(h)
         logits = self.lm_head(h)
         out = {"logits": logits}

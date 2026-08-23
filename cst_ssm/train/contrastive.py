@@ -32,23 +32,26 @@ class BilinearCritic(nn.Module):
         self.W = nn.Parameter(torch.randn(dim, dim) * (dim ** -0.5))
         self.symmetric = symmetric
 
+    @property
+    def effective_W(self) -> Tensor:
+        """实际参与打分的矩阵（symmetric 时为 W+Wᵀ）。批量打分请直接用它做 matmul。"""
+        return self.W + self.W.T if self.symmetric else self.W
+
     def forward(self, z: Tensor, zp: Tensor) -> Tensor:
         """z: (…, d), zp: (…, d) → scores: (…,)"""
-        if self.symmetric:
-            W = self.W + self.W.T
-        else:
-            W = self.W
-        return torch.einsum("...d,de,...e->...", z, W, zp)
+        return torch.einsum("...d,de,...e->...", z, self.effective_W, zp)
 
 
 def conditional_infonce_loss(z: Tensor, z_future: Tensor, critic: BilinearCritic,
                              temperature: float = 0.1,
                              frame_mask: Tensor | None = None) -> Tensor:
-    """条件 InfoNCE：z_t 预测 z_{t+1:t+τ}（正样本），batch 内其余为负样本。
+    """条件 InfoNCE：z_t 预测未来帧表征（正样本），batch 内其余为负样本。
 
     参数：
         z         : (B, L, d)  当前帧表征（CGU 蒸馏后的帧级特征）
-        z_future  : (B, L, d)  未来帧表征（detach，作为预测目标）
+        z_future  : (B, L, d)  **已对齐的未来表征**：z_future[t] = 帧 t+1 的特征（detach）。
+                    调用方（losses._compute_cpib）已完成 shift，本函数内部不得再次偏移，
+                    否则正样本会错成 t+2（双重 shift 破坏预测语义）。
         critic    : 双线性打分
         temperature: softmax 温度
         frame_mask: (B, L) bool，True=有效帧
@@ -59,9 +62,9 @@ def conditional_infonce_loss(z: Tensor, z_future: Tensor, critic: BilinearCritic
     if L < 2:
         return z.sum() * 0.0
 
-    # 正样本对：(z_t, z_future_{t+1})，取 t ∈ [0, L-2)
+    # 正样本对：(z_t, z_future[t])，取 t ∈ [0, L-2]；z_future[t] 已是帧 t+1 的特征
     z_t = z[:, :-1].reshape(-1, d)              # (B*(L-1), d)
-    z_pos = z_future[:, 1:].reshape(-1, d).detach()  # (B*(L-1), d)
+    z_pos = z_future[:, :-1].reshape(-1, d).detach()  # (B*(L-1), d)
 
     # 有效 mask
     if frame_mask is not None:
@@ -75,8 +78,11 @@ def conditional_infonce_loss(z: Tensor, z_future: Tensor, critic: BilinearCritic
     if N < 2:
         return z.sum() * 0.0
 
-    # 打分矩阵：(N, N)，对角线为正样本
-    logits = critic(z_t.unsqueeze(1), z_pos.unsqueeze(0)) / temperature  # (N, N)
+    # 打分矩阵：(N, N)，对角线为正样本。
+    # 用两次 matmul 而不是 einsum("...d,de,...e->...", z.unsqueeze(1), W, zp.unsqueeze(0))：
+    # 后者靠广播凑出 (N,N)，torch 虽然没有物化 (N,N,d)，但调度开销大得多
+    # （实测 N=1024/d=384 时 0.040s vs 0.003s）。数值完全一致。
+    logits = (z_t @ critic.effective_W) @ z_pos.t() / temperature        # (N, N)
     labels = torch.arange(N, device=z.device)
     loss = F.cross_entropy(logits, labels)
     return loss
@@ -119,13 +125,21 @@ def counterfactual_consistency_loss(
     distiller_forward,
     K: int = 2,
     frame_mask: Tensor | None = None,
+    ablate_frac: float = 0.1,
 ) -> Tensor:
     """反事实一致性损失：约束 CGU 分数与因果边际效应一致。
 
     方法（设计 §1.4）：
-      1. 对每帧随机消融 K 个 token（设 score=0），重新蒸馏得 frame_feat_cf
-      2. 边际效应 Δ_{t,i} = ‖frame_feat - frame_feat_cf‖（被消融 token 的重要性）
-      3. L_cf = MSE(s_{t,i}, sg[normalize(Δ_{t,i})])
+      1. 对每帧随机消融 n_ab = max(1, round(ablate_frac·P)) 个 token（设 score=0），重新蒸馏
+      2. 边际效应 Δ_t = ‖frame_feat − frame_feat_cf‖（被消融那批 token 的整体重要性）
+      3. L_cf = MSE(mean(s_被消融), sg[Δ_t / ‖frame_feat_t‖])
+
+    **归一化按帧、不按时间**：目标必须只依赖该帧自身。沿时间维归一化会让帧 t 的目标
+    取决于整段里 Δ 最大的那一帧，同一帧在不同 batch 组合下目标值都不同（详见实现处注释）。
+
+    **一次消融一批而不是一个**：TokenDistiller 的保留分支是 P 个 token 的加权均值，
+    单个 token 的边际影响只有约 1/P——P=9 时 Δ 已经很小，P=64 时基本是数值噪声，
+    回归的目标全是噪声，这一项等于没在学。按比例消融把 Δ 放大到可用量级。
 
     参数：
         scores          : (B, L, P) CGU 分数
@@ -134,20 +148,21 @@ def counterfactual_consistency_loss(
         distiller_forward: callable(tokens, scores) → (frame_feat, cpi)
         K               : MC 采样次数
         frame_mask      : (B, L)
+        ablate_frac     : 每帧消融的 token 比例
     返回：
         标量损失
     """
     B, L, P, d = tokens.shape
     if P < 2:
         return scores.sum() * 0.0
+    n_ab = max(1, min(P - 1, int(round(ablate_frac * P))))   # 至少 1、至多 P-1
 
     total_loss = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
     for _ in range(K):
-        # 随机选一个 token 消融（设 score=0）
-        ablate_idx = torch.randint(0, P, (B, L), device=scores.device)
+        # 每帧无放回地随机选 n_ab 个 token（argsort 随机键 = 随机排列取前 n_ab 个）
+        ablate_idx = torch.rand(B, L, P, device=scores.device).argsort(dim=-1)[..., :n_ab]
         scores_cf = scores.clone()
-        # scatter 把选中位置设为 0
-        scores_cf.scatter_(2, ablate_idx.unsqueeze(-1), 0.0)
+        scores_cf.scatter_(2, ablate_idx, 0.0)
 
         # 重新蒸馏
         with torch.no_grad():
@@ -157,11 +172,17 @@ def counterfactual_consistency_loss(
         delta = torch.linalg.vector_norm(
             frame_feat.detach() - feat_cf, dim=-1)        # (B, L)
 
-        # 被消融 token 的分数应高（因果重要）
-        s_ablated = scores.gather(2, ablate_idx.unsqueeze(-1)).squeeze(-1)  # (B, L)
+        # 被消融那批 token 的平均分数应高（因果重要）
+        s_ablated = scores.gather(2, ablate_idx).mean(dim=-1)               # (B, L)
 
-        # 归一化 delta → [0,1]
-        delta_norm = delta / (delta.amax(dim=1, keepdim=True) + 1e-8)
+        # 归一化 Δ → [0,1]：除以**该帧自身**的特征范数，得到"相对变化量"。
+        # 早先是 delta / delta.amax(dim=1)，沿**时间**维归一化——目标 s_ablated 是逐帧
+        # 逐 token 分数的均值（每帧独立的 [0,1] 量），而沿时间归一化让帧 t 的目标取决于
+        # 整段里 Δ 最大的那一帧：同一帧在不同 batch 组合下目标值不同，且只有全局最大的
+        # 那帧目标为 1、其余被压小，净效果就是把 s 拽向一个常数。改成逐帧的相对变化后，
+        # 目标只依赖该帧自身，与 s_ablated 的语义维度一致。
+        denom = torch.linalg.vector_norm(frame_feat.detach(), dim=-1)       # (B, L)
+        delta_norm = (delta / denom.clamp_min(1e-8)).clamp(0.0, 1.0)
 
         # MSE
         diff = (s_ablated - delta_norm.detach()) ** 2     # (B, L)
@@ -183,6 +204,7 @@ class CPIBWeights:
     nce: float = 0.1          # λ1：InfoNCE
     kl: float = 0.01          # λ2：信息瓶颈率预算
     cf: float = 0.05          # λ3：反事实一致性
+    cf_ablate_frac: float = 0.1   # 反事实每帧消融的 token 比例（太小则 Δ 淹没在噪声里）
     rho: float = 0.3          # 信息瓶颈保留预算
     cf_anneal_steps: int = 2000   # L_cf 退火步数（之后权重→0）
 
@@ -223,7 +245,7 @@ def cpib_loss(
     if cf_weight > 1e-8:
         l_cf = counterfactual_consistency_loss(
             scores, frame_feat, tokens, distiller_forward,
-            K=2, frame_mask=frame_mask)
+            K=2, frame_mask=frame_mask, ablate_frac=w.cf_ablate_frac)
         total = total + cf_weight * l_cf
         comp["cf"] = l_cf.detach()
 

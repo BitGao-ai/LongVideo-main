@@ -27,7 +27,7 @@ from common import (read_jsonl, segment_from_row, temporal_iou, boundary_mae,
 
 def evaluate(manifest: list[dict], preds: dict[str, tuple[float, float]],
              snap: bool = False) -> dict:
-    ious, maes, breaks = [], [], []
+    ious, maes, breaks, floors = [], [], [], []
     per_delta = defaultdict(lambda: {"mae": [], "break": []})
     n_missing = 0
     for row in manifest:
@@ -43,15 +43,18 @@ def evaluate(manifest: list[dict], preds: dict[str, tuple[float, float]],
         mae = boundary_mae(pred, gt)
         floor = seg.floor()
         ious.append(iou); maes.append(mae); breaks.append(1.0 if mae < floor else 0.0)
+        floors.append(floor)
         per_delta[row.get("delta", "NA")]["mae"].append(mae)
         per_delta[row.get("delta", "NA")]["break"].append(1.0 if mae < floor else 0.0)
 
+    mae_eval = mean(maes)             # 分子分母同一批 evaluated 行，避免漏答操纵指标
+    floor_eval = mean(floors)
     res = {
         "n_eval": len(maes), "n_missing": n_missing,
-        "sub_frame_MAE": mean(maes),
-        "mean_floor(δ/4)": mean([segment_from_row(r).floor() for r in manifest]),
+        "sub_frame_MAE": mae_eval,
+        "mean_floor(δ/4)": floor_eval,
         # 头号判据：MAE/floor < 1 ⇒ 穿透离散地板（只有连续查询能做到）
-        "MAE/floor_ratio": (mean(maes) / mean([segment_from_row(r).floor() for r in manifest])),
+        "MAE/floor_ratio": (mae_eval / floor_eval) if floor_eval > 0 else float("nan"),
         "R@0.7": recall_at_iou(ious, 0.7),
         "R@0.9": recall_at_iou(ious, 0.9),
         # 次判据：per-sample 低于地板的比例。理论上 离散→0.5(对称于地板)、连续→1.0

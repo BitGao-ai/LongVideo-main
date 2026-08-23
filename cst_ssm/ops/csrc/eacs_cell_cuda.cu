@@ -9,6 +9,8 @@
 
 #include <torch/extension.h>
 #include <c10/util/complex.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 
 using cf = c10::complex<float>;
@@ -18,12 +20,16 @@ __device__ __forceinline__ cf cexp(cf z) {
     float e = expf(z.real());
     return cf(e * cosf(z.imag()), e * sinf(z.imag()));
 }
-__device__ __forceinline__ cf cexpm1(cf z) {           // 稳定复数 expm1（|z| 小走 Taylor）
-    if (z.real() * z.real() + z.imag() * z.imag() < 1e-8f) {
-        cf z2 = z * z; cf z3 = z2 * z;
-        return z + cscale(z2, 0.5f) + cscale(z3, 1.f / 6.f);
-    }
-    return cexp(z) - cf(1.f, 0.f);
+// 无分支稳定复数 expm1：与 Python 端 ops/discretization.complex_expm1 **同一个公式**。
+//   Re = expm1(a)·cos b − 2·sin²(b/2)，  Im = (expm1(a)+1)·sin b
+// 两条实部项各自都不抵消，z→0 时天然稳定，不需要 |z| 小走 Taylor 的分支。
+// 两端必须保持同式：B10 修的"前向轨迹与反向重算轨迹分叉"依赖 CPU/CUDA 门控判据一致，
+// 分支阈值处的 1e-7 级跳变足以让残差落在 ε 附近的帧翻转门控。
+__device__ __forceinline__ cf cexpm1(cf z) {
+    float a = z.real(), b = z.imag();
+    float em1 = expm1f(a);
+    float sh = sinf(0.5f * b);
+    return cf(em1 * cosf(b) - 2.f * sh * sh, (em1 + 1.f) * sinf(b));
 }
 
 // 前向内核：一个 block 处理一个 batch b。
@@ -152,7 +158,22 @@ std::vector<torch::Tensor> eacs_cell_fwd(
         double eps, double eta, double var_eps, double dt_init,
         double dt_min, double dt_max) {
     TORCH_CHECK(u.is_cuda(), "expects CUDA tensors");
-    int B = u.size(0), L = u.size(1), H = u.size(2), N = lam.size(1);
+    TORCH_CHECK(u.dim() == 3 && lam.dim() == 2, "u:(B,L,H), lam:(H,N)");
+    TORCH_CHECK(lam.size(0) == u.size(2), "lam 的 H 必须与 u 的 H 一致");
+    // .contiguous() 的结果必须先绑到具名变量再取 data_ptr：写成
+    // `lam.contiguous().data_ptr()` 时那个临时张量在语句结束即析构，而 kernel 是异步的
+    // ——同流下 caching allocator 恰好能保证复用顺序，但这是不该依赖的行为。
+    auto lam_c = lam.to(torch::kComplexFloat).contiguous();
+    auto logdt_c = log_dt.to(torch::kFloat32).contiguous();
+    auto u_c = u.to(torch::kFloat32).contiguous();
+    auto Bc_c = Bc.to(torch::kComplexFloat).contiguous();
+    auto Cc_c = Cc.to(torch::kComplexFloat).contiguous();
+    auto t_c = t.to(torch::kFloat32).contiguous();
+    auto Dp_c = Dp.to(torch::kFloat32).contiguous();
+    auto mean_c = mean.to(torch::kFloat32).contiguous();
+    auto var_c = var.to(torch::kFloat32).contiguous();
+
+    int B = u_c.size(0), L = u_c.size(1), H = u_c.size(2), N = lam_c.size(1);
     auto copt = torch::TensorOptions().dtype(torch::kComplexFloat).device(u.device());
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(u.device());
     auto h_pi = torch::zeros({B, H, N}, copt);
@@ -165,19 +186,23 @@ std::vector<torch::Tensor> eacs_cell_fwd(
     auto resid = torch::zeros({B, L}, fopt);
 
     int threads = 256;
-    eacs_cell_fwd_kernel<<<B, threads>>>(
-        reinterpret_cast<cf*>(lam.contiguous().data_ptr()),
-        log_dt.contiguous().data_ptr<float>(), u.contiguous().data_ptr<float>(),
-        reinterpret_cast<cf*>(Bc.contiguous().data_ptr()),
-        reinterpret_cast<cf*>(Cc.contiguous().data_ptr()),
-        t.contiguous().data_ptr<float>(), Dp.contiguous().data_ptr<float>(),
-        mean.contiguous().data_ptr<float>(), var.contiguous().data_ptr<float>(),
+    // 必须在 PyTorch 的**当前流**上发射：默认流与 AMP / CUDA graph / 多流流水线下
+    // PyTorch 实际使用的流不是同一个，会与前后算子产生 race。
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    eacs_cell_fwd_kernel<<<B, threads, 0, stream>>>(
+        reinterpret_cast<cf*>(lam_c.data_ptr()),
+        logdt_c.data_ptr<float>(), u_c.data_ptr<float>(),
+        reinterpret_cast<cf*>(Bc_c.data_ptr()),
+        reinterpret_cast<cf*>(Cc_c.data_ptr()),
+        t_c.data_ptr<float>(), Dp_c.data_ptr<float>(),
+        mean_c.data_ptr<float>(), var_c.data_ptr<float>(),
         reinterpret_cast<cf*>(h_pi.data_ptr()), u_pi.data_ptr<float>(),
         t_pi.data_ptr<float>(), reinterpret_cast<cf*>(B_pi.data_ptr()),
         reinterpret_cast<cf*>(C_pi.data_ptr()),
         y.data_ptr<float>(), gate.data_ptr<float>(), resid.data_ptr<float>(),
         B, L, H, N, (float)eps, (float)eta, (float)var_eps, (float)dt_init,
         (float)dt_min, (float)dt_max);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();   // 否则启动失败会静默返回全零
     return {y, gate, resid};
 }
 

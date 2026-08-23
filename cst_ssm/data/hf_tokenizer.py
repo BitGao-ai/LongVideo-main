@@ -36,7 +36,7 @@ class HFTokenizer:
 
     def __init__(self, model_name: str,
                  video_token_id: int | None = None,
-                 max_video_tokens: int = 512):
+                 max_video_tokens: int = 8192):
         AutoProcessor = _import_processor()
         self.proc = AutoProcessor.from_pretrained(model_name)
         self.tok = getattr(self.proc, "tokenizer", self.proc)
@@ -105,6 +105,13 @@ class HFTokenizer:
             head_ids = self.tok.encode(head, add_special_tokens=False) if head.strip() else []
             tail_ids = self.tok.encode(tail, add_special_tokens=False) if tail.strip() else []
             n = min(self._n_video, self.max_video_tokens)
+            if n < self._n_video and not getattr(self, "_warned_truncate", False):
+                # 占位符数量必须 == 有效视觉状态数（_scatter_visual 约定）；截断后尾部帧
+                # 特征将被零填充丢弃——不报错保运行，但必须显式告警，避免静默丢帧
+                print(f"[HFTokenizer] 警告: 帧数 {self._n_video} > max_video_tokens="
+                      f"{self.max_video_tokens}，video 占位符被截断，尾部 {self._n_video - n} "
+                      f"帧视觉特征将被丢弃。请调大 max_video_tokens 或降低采样帧数。")
+                self._warned_truncate = True
             return head_ids + [self.video_token_id] * n + tail_ids
         # 无占位符：原样编码（纯文本样本）
         return self.tok.encode(prompt, add_special_tokens=False)

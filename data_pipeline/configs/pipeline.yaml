@@ -33,8 +33,8 @@ sampler:
   saliency: absdiff                   # absdiff | flow（光流更准但慢）
   theta: 0.12                         # 累积显著性触发阈值（越小越密）
   dt_min_s: 0.2                       # 最小帧间隔（高动态段限帧率）
-  dt_max_s: 4.0                       # 最大帧间隔（静止段兜底强制采样）
-  max_frames: 512                     # 与 DataConfig.max_frames 对齐
+  dt_max_s: 2.0                       # 最大帧间隔（静止段兜底强制采样）；定位精度地板 = δ/4
+  max_frames: 8192                    # **上限**非目标（保险丝）；须与 DataConfig.max_frames 对齐
 
 # ---------------- (B) 特征抽取 ----------------
 extract:
@@ -69,4 +69,4 @@ validate:
   check_dim_consistency: true
   check_ref_reachable: true
   warn_constant_dt: true              # Δt 退化为常数时告警（采样器可能没生效）
-  feat_dim: 3584
+  feat_dim: null                      # null=从特征自动推断（推荐）；换模型后无需手改

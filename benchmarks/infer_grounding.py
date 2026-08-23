@@ -116,8 +116,8 @@ class HashDirectionScorer:
                            llm=LLMConfig(vocab_size=259, dim=128, n_layer=2, n_head=4, max_len=64))
         model = CSTSSMModel(cfg).to(self.device).eval()
         if self.ckpt:
-            sd = torch.load(self.ckpt, map_location=self.device)
-            model.load_state_dict(sd.get("model", sd), strict=False)
+            from cst_ssm.utils import load_checkpoint      # 打印 missing/unexpected，不静默
+            load_checkpoint(model, self.ckpt, tag="hash-scorer")
         self._model, self._feat_dim = model, feat_dim
 
     def score(self, feats: np.ndarray, ts: np.ndarray, t_query: np.ndarray, query: str) -> np.ndarray:
@@ -164,12 +164,8 @@ class TrainedGroundingScorer:
                                llm=LLMConfig(vocab_size=259, dim=128, n_layer=2, n_head=4, max_len=64))
         model = CSTSSMModel(cfg).to(self.device).eval()
         if self.ckpt:
-            if os.path.isdir(self.ckpt):                            # 分片检查点目录
-                from cst_ssm.utils import load_sharded
-                model.load_state_dict(load_sharded(self.ckpt), strict=False)
-            else:
-                sd = torch.load(self.ckpt, map_location=self.device)
-                model.load_state_dict(sd.get("model", sd), strict=False)
+            from cst_ssm.utils import load_checkpoint      # 打印 missing/unexpected，不静默
+            load_checkpoint(model, self.ckpt, tag="grounding-scorer")
         self._model, self._tok, self._feat_dim = model, ByteTokenizer(), feat_dim
 
     def score(self, feats, ts, t_query, query: str) -> np.ndarray:

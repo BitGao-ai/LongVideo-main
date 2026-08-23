@@ -142,7 +142,8 @@ def build_prompt(question: str, options: list) -> str:
     return f"<video> {q}\n" + "\n".join(lines)
 
 
-def convert_record(rec: dict, bench: str, idx: int, feature_subdir: str) -> dict | None:
+def convert_record(rec: dict, bench: str, idx: int, feature_subdir: str,
+                   feature_ext: str = ".npy") -> dict | None:
     ad = ADAPTERS[bench]
     vid = _first(rec, ad["vid"])
     if vid is None:
@@ -155,7 +156,7 @@ def convert_record(rec: dict, bench: str, idx: int, feature_subdir: str) -> dict
     row = dict(
         video_id=vid,
         query_id=query_id,
-        feature_ref=f"{feature_subdir}/{vid}.npy",
+        feature_ref=f"{feature_subdir}/{vid}{feature_ext}",
         prompt=build_prompt(_first(rec, ad["q"], ""), options),
         answer=letter,
         answer_index=aidx,
@@ -186,7 +187,7 @@ def run(args):
     buckets, tasks = Counter(), Counter()
     with open(args.out, "w", encoding="utf-8") as fout:
         for i, rec in enumerate(_iter_records(args.src)):
-            row = convert_record(rec, args.bench, i, args.feature_subdir)
+            row = convert_record(rec, args.bench, i, args.feature_subdir, args.feature_ext)
             if row is None:
                 n_skip += 1; continue
             if row["answer_index"] < 0:
@@ -209,7 +210,19 @@ def main():
     ap.add_argument("--src", required=True, help="官方标注 json/jsonl（parquet 先转 jsonl）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--feature-subdir", default="features_npy", help="feature_ref 前缀")
-    run(ap.parse_args())
+    ap.add_argument("--feature-ext", default=".npy", choices=[".npy", ".npz"],
+                    help="feature_ref 的扩展名。默认 .npy —— 对应"
+                         "extract_features → npz_to_npy 之后的规模化流水线（真 mmap）。"
+                         "若**跳过** npz_to_npy、直接用 extract_features 的 .npz 产物，"
+                         "必须显式传 --feature-ext .npz，否则每一行都指向不存在的文件")
+    a = ap.parse_args()
+    print(f"[convert:{a.bench}] feature_ref 形如 {a.feature_subdir}/<video_id>{a.feature_ext}")
+    if a.feature_ext == ".npy":
+        print(f"[convert:{a.bench}] 提示：.npy 需要先跑 npz_to_npy.py 转换；"
+              f"若你只有 extract_features 直出的 .npz，请加 --feature-ext .npz")
+    print(f"[convert:{a.bench}] 放行前务必跑 validate_dataset --strict 核对 feature_ref 可达性——"
+          f"不可达时 VideoTemporalDataset 会替换/占位样本，评测仍会照常报出一个准确率")
+    run(a)
 
 
 if __name__ == "__main__":

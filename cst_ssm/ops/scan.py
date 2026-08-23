@@ -55,12 +55,43 @@ def sequential_scan_diag(a: Tensor, b: Tensor, h_init: Tensor | None = None) -> 
     return torch.stack(outs, dim=1)
 
 
+def chunked_scan_diag(a: Tensor, b: Tensor, chunk: int,
+                      h_init: Tensor | None = None) -> Tensor:
+    """分块 + 梯度检查点的并行扫描，数值等价于 associative_scan_diag。
+
+    Hillis-Steele 每层都产生新的全量 (B,L,H,N) 复数张量，autograd 会把 log2(L) 层
+    全部保留 → 激活 O(L·H·N·logL)。B=1,L=1024,H=384,N=64 时单个张量就是 201MB，
+    ×2 个量 ×10 层就是 GB 量级。
+
+    一阶线性递推可以按块串行、块间只传 h：把每块包进 checkpoint，
+    峰值降到 O(chunk·H·N·log(chunk)) + O(L·H·N)（输出本身）。
+    """
+    import torch.utils.checkpoint as _ckpt
+    L = a.shape[1]
+    if chunk <= 0 or L <= chunk or not torch.is_grad_enabled():
+        return associative_scan_diag(a, b, h_init)
+    outs, h = [], h_init
+    for k0 in range(0, L, chunk):
+        k1 = min(k0 + chunk, L)
+        hk = _ckpt.checkpoint(associative_scan_diag, a[:, k0:k1], b[:, k0:k1], h,
+                              use_reentrant=False)
+        outs.append(hk)
+        h = hk[:, -1]                      # 块末状态即下一块的初值
+    return torch.cat(outs, dim=1)
+
+
 def selective_scan(a: Tensor, b: Tensor, h_init: Tensor | None = None,
-                   backend: str = "auto") -> Tensor:
+                   backend: str = "auto", chunk: int = 0) -> Tensor:
     """统一变步长扫描入口：CUDA 内核（可用且在 GPU）否则纯 PyTorch associative scan。
 
     backend: "auto"（默认，自动选）| "cuda"（强制，不可用则报错）| "pytorch"（强制纯 PyTorch）。
     CUDA 路径不支持 h_init（内核初值为 0）；给了 h_init 自动走 PyTorch。
+    chunk>0 时纯 PyTorch 路径按块做梯度检查点省显存（数值等价，见 chunked_scan_diag）。
+
+    **优先级：内核 > chunk。** backend="auto" 且在 CUDA 上、h_init 为空时优先走内核，
+    此时 chunk 被忽略——内核自身不物化 log L 层中间量，显存已经友好，但「设了 chunk 就
+    一定在做分块检查点」的预期在 GPU 上不成立（ContinuousSSMLayer 这类消融基线的显存
+    曲线不会体现 chunk 的效果）。要强制走分块检查点请显式传 backend="pytorch"。
     """
     if backend != "pytorch" and a.is_cuda and h_init is None:
         try:
@@ -71,4 +102,6 @@ def selective_scan(a: Tensor, b: Tensor, h_init: Tensor | None = None,
             pass
     if backend == "cuda":
         raise RuntimeError("CUDA 变步长扫描不可用（需 a 在 GPU、扩展编译成功、且 h_init 为空）。")
+    if chunk and chunk > 0:
+        return chunked_scan_diag(a, b, chunk, h_init)
     return associative_scan_diag(a, b, h_init)

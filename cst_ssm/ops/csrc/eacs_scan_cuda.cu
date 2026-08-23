@@ -12,6 +12,8 @@
 
 #include <torch/extension.h>
 #include <c10/util/complex.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 
 using cf = c10::complex<float>;
@@ -66,23 +68,30 @@ std::vector<torch::Tensor> scan_fwd(torch::Tensor a, torch::Tensor b) {
     auto h = torch::empty_like(b);
     long BHN = (long)B * H * N; int threads = 256;
     long blocks = (BHN + threads - 1) / threads;
-    scan_fwd_kernel<<<blocks, threads>>>(
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    scan_fwd_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<cf*>(a.data_ptr()), reinterpret_cast<cf*>(b.data_ptr()),
         reinterpret_cast<cf*>(h.data_ptr()), B, L, H, N);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {h};
 }
 
 std::vector<torch::Tensor> scan_bwd(torch::Tensor a, torch::Tensor h, torch::Tensor grad_h) {
+    TORCH_CHECK(a.is_cuda() && h.is_cuda() && grad_h.is_cuda(), "expects CUDA tensors");
+    TORCH_CHECK(a.scalar_type() == torch::kComplexFloat, "expects complex64");
+    TORCH_CHECK(a.dim() == 4, "expects (B,L,H,N)");
     a = a.contiguous(); h = h.contiguous(); grad_h = grad_h.contiguous();
     int B = a.size(0), L = a.size(1), H = a.size(2), N = a.size(3);
     auto grad_a = torch::empty_like(a), grad_b = torch::empty_like(a);
     long BHN = (long)B * H * N; int threads = 256;
     long blocks = (BHN + threads - 1) / threads;
-    scan_bwd_kernel<<<blocks, threads>>>(
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    scan_bwd_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<cf*>(a.data_ptr()), reinterpret_cast<cf*>(h.data_ptr()),
         reinterpret_cast<cf*>(grad_h.data_ptr()),
         reinterpret_cast<cf*>(grad_a.data_ptr()), reinterpret_cast<cf*>(grad_b.data_ptr()),
         B, L, H, N);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {grad_a, grad_b};
 }
 

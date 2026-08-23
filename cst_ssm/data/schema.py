@@ -20,6 +20,8 @@ class VideoSample:
     # 视觉来源（二选一）
     feature_ref: Optional[str] = None    # .npz 路径
     frame_dir: Optional[str] = None      # 帧图目录
+    # 帧数（元数据）：长度分桶采样器用它避免逐个探测特征文件头。缺省时会回退到探测。
+    n_frames: Optional[int] = None
     # 时间轴（feature 模式下也可由 .npz 内 timestamps 提供，这里可留空）
     timestamps: Optional[list] = None    # 每帧秒级时间戳
     duration: float = 0.0
@@ -36,8 +38,11 @@ class VideoSample:
 class DataConfig:
     manifest: str                        # jsonl，每行一个 VideoSample
     mode: str = "feature"                # feature | pixel
-    max_frames: int = 512                # 单样本最大帧数（超出按均匀/事件抽样）
-    max_text_len: int = 512
+    max_frames: int = 8192               # 单样本最大帧数（超出按均匀/事件抽样）
+    # 必须 ≥ max_frames + prompt 文本长度：prompt 里每帧展开一个 video 占位符，
+    # 不够会在 build_lm_example 里被 [:max_len] 截掉尾部帧（静默丢视觉信息）。
+    # 8704 = 8192 帧 + 512 文本余量。
+    max_text_len: int = 8704
     feat_patches: int = 1                # 每帧 patch 数 P
     feat_dim: int = 768
     frame_size: int = 224                # pixel 模式帧分辨率

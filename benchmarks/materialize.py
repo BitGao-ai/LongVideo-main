@@ -25,6 +25,7 @@ csg_build/vfr_build 只产出 `input_grid`（模型可见的帧时间戳，可�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -150,7 +151,10 @@ def run(args):
                 fps = float(r.get("fps", 30.0))
                 _ = grid_to_frame_idx(grid, fps)       # 走一遍映射逻辑（验证）
                 L = len(grid)
-                feats = np.random.default_rng(abs(hash(sid)) % (2**32)).standard_normal(
+                # 种子用 sha1 而非 abs(hash(sid))：str 的内建 hash 每进程带随机盐
+                # （PYTHONHASHSEED），同一 sid 两次运行拿到不同种子，dry-run 产物不可复现。
+                seed = int(hashlib.sha1(sid.encode()).hexdigest()[:8], 16)
+                feats = np.random.default_rng(seed).standard_normal(
                     (L, args.patches, args.out_hidden)).astype(np.float16)
                 ts = np.asarray(grid, dtype=np.float32)
             else:
