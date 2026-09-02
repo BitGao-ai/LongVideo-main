@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .pooling import single_query_pool
+from ..dtypes import align_to_param
 
 
 def window_partition(x: Tensor, ws: int) -> Tensor:
@@ -196,6 +197,11 @@ class FeatureAdapter(nn.Module):
 
     配合“特征缓存”数据流（见 data/）：视觉骨干离线跑好，训练只读特征，省显存与算力。
     提供 get_tokens() 返回投影后的逐 token 特征 (B,L,P,d_out)，供 CPIBDistill/CGU 消费。
+
+    **本类是"低精度特征"进入模型的唯一入口**：特征在磁盘上是 float16，数据侧默认不再
+    升精度（见 utils/dtypes 的说明），所以这里必须做一次 dtype 对齐——autocast 开着就
+    交给 autocast，没开就升到参数精度。像素模式（WindowedSpatialEncoder）不需要：
+    torchvision 的 ToTensor 恒产出 float32。
     """
 
     def __init__(self, d_in: int, d_out: int, n_heads: int = 8):
@@ -216,6 +222,10 @@ class FeatureAdapter(nn.Module):
                 f"{self.proj.in_features}。feat_dim 由抽特征的视觉塔唯一决定"
                 f"（如 Qwen3-VL-4B=2560），请检查 --config 里的 model.feat_dim 是否与 "
                 f"--manifest 指向的特征同源；训练脚本用 cst_ssm.data.align_feat_dim 自动对齐。")
+        # dtype 对齐（见类 docstring）：dtype 已一致时是零开销直通，所以旧的 float32
+        # 数据流逐位不变；float16 数据流在 autocast 下省掉整份 fp32 副本、在 autocast
+        # 之外升精度后与旧行为逐位相同。
+        feats = align_to_param(feats, self.proj.weight)
         return self.norm(self.proj(feats))              # (B, L, P, d_out)
 
     def forward(self, feats: Tensor) -> Tensor:

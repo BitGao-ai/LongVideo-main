@@ -49,6 +49,38 @@ def model_config_from_dict(d: dict) -> CSTSSMConfig:
     return CSTSSMConfig(**{k: v for k, v in d.items() if k in known})
 
 
+def require_model_config(manifest: str | None, config_path: str | None, script: str,
+                         allow_default: bool = False,
+                         fallback: str = "d_model=96、stand-in LLM dim=128") -> None:
+    """真实 manifest 却拿不到 model 配置段时直接退出（除非显式放行）。
+
+    三个训练脚本的 build_cfg 在 YAML 缺 model 段时会退到一份冒烟尺寸的
+    CSTSSMConfig(d_model=96, llm.dim=128)。对合成数据这是合理的默认；配上**真实
+    manifest** 就是一个几万步之后才暴露的错误：stage-1 会照常收敛、照常写出检查点，
+    直到 stage-2 热启才因 d_model 96≠384 把 vision.*/temporal.* 整段跳过，热启完全
+    白做（run.md §2 的反例，实际浪费过一次 20000 步的训练）。
+
+    与 align_feat_dim 是同一类入口守卫，只是拦的维度不同，且**补救方式相反**：
+    feat_dim 由特征文件唯一确定，能自动校正；d_model 是建模超参、没有唯一正确值，
+    只能要求两个阶段用同一份 --config，所以这里只能退出，不能"自动修"。
+
+    必须在入口拦是因为 d_model 错配在运行期没有任何征兆——loss 照常下降、检查点照常
+    落盘，报错要等到下一个阶段的 load_checkpoint。只在 build_cfg 的兜底分支调用。
+    """
+    if not manifest or allow_default:
+        return
+    why = "没有传 --config" if not config_path else f"--config {config_path} 里没有 model: 段"
+    raise SystemExit(
+        f"[cfg] 错误: 给了真实 manifest（{manifest}）但{why}，本次将退到脚本内置的冒烟兜底"
+        f"配置（{fallback}）。\n"
+        f"[cfg]   这一路训得完也存得下检查点，但 d_model 与生产配置不一致，下一阶段 --load "
+        f"热启时 vision.*/temporal.* 会因形状不匹配被整段丢弃——这轮训练等于白跑。\n"
+        f"[cfg]   请补上配置：\n"
+        f"[cfg]     python3 {script} --config configs/default.yaml ...\n"
+        f"[cfg]   若确实只想用冒烟尺寸验证数据管线（不打算把检查点用于下一阶段），"
+        f"显式加 --allow-default-config 放行。")
+
+
 def _apply_section(obj, d: dict | None, section: str, skip: set[str] | None = None):
     """把 YAML 的一段覆盖到已构造好的 dataclass 实例上（就地 setattr）。
 

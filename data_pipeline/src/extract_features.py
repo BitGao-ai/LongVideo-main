@@ -29,6 +29,11 @@ import numpy as np
 from .adaptive_sampler import SamplerConfig, sample_video
 
 
+# Qwen3VLConfig 的占位默认值。真实 Qwen3-VL-4B 视觉塔是 2560——这个常量**只**在
+# --dry-run 且拿不到真实 config.json 时兜底，任何真实抽取路径都不会用到它。
+_FALLBACK_OUT_HIDDEN = 3584
+
+
 # --------------------------- 视觉塔封装 ---------------------------
 class VisionTower:
     """启动即显式加载 Qwen3-VL 视觉塔（带进度日志），按给定帧索引抽 patch 特征 [n,P,d]。"""
@@ -113,6 +118,47 @@ def _synthetic(frame_idx: np.ndarray, ts: np.ndarray, patches: int, d: int, seed
     return rng.standard_normal((L, patches, d)).astype(np.float16), ts.astype(np.float32)
 
 
+def _out_hidden_from_config(model: str) -> Optional[int]:
+    """不加载权重、不依赖 transformers，直接从本地模型目录的 config.json 读视觉塔输出维。
+
+    给 --dry-run 用：合成特征的 d 必须与**真实底座**一致，否则 dry-run 跑通的那条链路
+    和真实训练不是同一条（d=3584 的假特征训出的 stage-1，换成真实 2560 的特征就作废）。
+    --model 指向本地目录时这一步是免费的；指向 HF 仓库名则拿不到，返回 None。
+    """
+    cfg_path = os.path.join(model, "config.json")
+    if not os.path.isfile(cfg_path):
+        return None
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        v = (cfg.get("vision_config") or {}).get("out_hidden_size")
+        return int(v) if v else None
+    except Exception:
+        return None
+
+
+def _resolve_out_hidden(args) -> int:
+    """确定 --dry-run 合成特征的 d：显式 --out-hidden > 本地 config.json > 兜底常量。
+
+    此前 --out-hidden 默认写死 3584（Qwen3VLConfig 的占位默认值），而 Qwen3-VL-4B 实测
+    是 2560。于是 dry-run 产出的 .npz 是 3584 维，manifest 也按 3584 推断，stage-1 照着
+    训完，直到 stage-2 用真底座建模型（2560）才对不上——白烧一轮。
+    """
+    if args.out_hidden is not None:
+        return int(args.out_hidden)
+    d = _out_hidden_from_config(args.model)
+    if d:
+        print(f"[extract] --dry-run: 未指定 --out-hidden，已从 {args.model}/config.json "
+              f"读到视觉塔输出维 out_hidden_size={d}，合成特征按此维生成（与真实抽取一致）")
+        return d
+    print(f"[extract] ⚠ --dry-run: 未指定 --out-hidden，且 --model='{args.model}' 不是"
+          f"能读到 config.json 的本地目录，只能用兜底 d={_FALLBACK_OUT_HIDDEN}。"
+          f"这个值**未必**等于真实视觉塔的输出维（Qwen3-VL-4B 实测 2560），"
+          f"用它跑出的 stage-1 检查点在换真特征后不可用。"
+          f"如需与真实链路一致，请显式 --out-hidden <真实维度> 或让 --model 指向本地权重目录")
+    return _FALLBACK_OUT_HIDDEN
+
+
 # --------------------------- 缓存一致性 ---------------------------
 def _sampler_fingerprint(scfg: SamplerConfig, patches: int, model: str, dry_run: bool,
                          max_frame_tokens: int = 0) -> str:
@@ -167,9 +213,17 @@ def _cached_fingerprint(npz_path: str) -> Optional[str]:
 
 def _save_npz(out_npz: str, feats, ts, fp: str, meta: dict):
     """落盘特征 + 时间戳 + 参数指纹 + 溯源 meta（meta 以扁平标量键存储，
-    下游只按 features/timestamps 取键，额外键不破坏兼容）。"""
+    下游只按 features/timestamps 取键，额外键不破坏兼容）。
+
+    meta_model / meta_out_hidden / meta_patches 是**溯源三件套**：sampler_fp 只能回答
+    "参数变没变"，回答不了"这批特征是谁抽的"。把底座名与维度直接写进文件，
+    train_stage2 才能在热启前指着具体文件说清楚"你的特征是 X 抽的、底座是 Y"。
+    """
     np.savez(out_npz, features=feats, timestamps=ts,
              sampler_fp=np.array(fp),
+             meta_model=np.array(str(meta.get("model", ""))),
+             meta_out_hidden=np.int64(feats.shape[-1] if getattr(feats, "ndim", 0) >= 1 else 0),
+             meta_patches=np.int64(feats.shape[-2] if getattr(feats, "ndim", 0) >= 3 else 0),
              meta_strategy=np.array(str(meta.get("strategy", ""))),
              meta_duration=np.float32(meta.get("duration", 0.0)),
              meta_n_sampled=np.int64(meta.get("n_sampled", len(ts))),
@@ -190,6 +244,7 @@ def run(args):
                          saliency_accum=args.saliency_accum,
                          max_frames=args.max_frames)
     os.makedirs(args.out, exist_ok=True)
+    out_hidden = _resolve_out_hidden(args) if args.dry_run else 0
     tower = None if args.dry_run else VisionTower(args.model, args.patches, args.chunk_frames,
                                                    dtype=args.dtype, device=args.device,
                                                    max_frame_tokens=args.max_frame_tokens)
@@ -232,15 +287,16 @@ def run(args):
                     rng = np.random.default_rng(_seed_from_id(vid))
                     L = int(rng.integers(20, args.max_frames))
                     ts = np.cumsum(rng.uniform(scfg.dt_min_s, scfg.dt_max_s, L)).astype(np.float32)
-                    feats, ts = _synthetic(np.arange(L), ts, args.patches, args.out_hidden, seed=L)
+                    feats, ts = _synthetic(np.arange(L), ts, args.patches, out_hidden, seed=L)
                     meta = dict(duration=float(ts[-1]), n_sampled=L, strategy=args.sampler,
-                                event_density=round(L/float(ts[-1]), 4))
+                                event_density=round(L/float(ts[-1]), 4), model="dry-run")
                 else:
                     video_path = r.get("video_path") or os.path.join(args.video_root, r.get("rel_path", vid + ".mp4"))
                     print(f"[extract] ({idx}/{len(rows)}) {vid}: 开始变步长采样 → {video_path}", flush=True)
                     frame_idx, ts, meta = sample_video(video_path, scfg)
                     print(f"[extract] ({idx}/{len(rows)}) {vid}: 采样完成 L={len(frame_idx)}（{time.time()-t0:.1f}s），开始解码取帧+视觉塔编码", flush=True)
                     feats, ts = tower.encode(video_path, frame_idx, ts)
+                    meta["model"] = args.model
                     print(f"[extract] ({idx}/{len(rows)}) {vid}: 编码完成（累计 {time.time()-t0:.1f}s）", flush=True)
                 _save_npz(out_npz, feats, ts, fp, meta)
                 ok += 1
@@ -268,8 +324,11 @@ def main():
     ap.add_argument("--manifest", required=True, help="筛选通过清单 jsonl（含 video_id / video_path）")
     ap.add_argument("--out", default="data/features")
     ap.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct")
-    ap.add_argument("--out-hidden", type=int, default=3584,
-                    help="仅 --dry-run 合成特征用；真实抽取维度由视觉塔决定（如 Qwen3-VL-4B=2560）")
+    ap.add_argument("--out-hidden", type=int, default=None,
+                    help="仅 --dry-run 合成特征用的维度 d；真实抽取维度由视觉塔决定。"
+                         "缺省时自动从 --model 指向的本地目录 config.json 读 "
+                         "vision_config.out_hidden_size（Qwen3-VL-4B=2560），读不到才退回 "
+                         f"{_FALLBACK_OUT_HIDDEN} 并告警——那个值只是 Qwen3VLConfig 的占位默认值")
     ap.add_argument("--patches", type=int, default=9, help="空间池化目标 P：1/9/64")
     ap.add_argument("--max-frame-tokens", type=int, default=256,
                     help="每帧送进视觉塔的合并 token 数上限（约束输入分辨率）。默认 256≈512×512，"

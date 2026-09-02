@@ -13,6 +13,20 @@ from torch import Tensor
 
 
 class LoRALinear(nn.Module):
+    """LoRA 包装：y = W0·x + (α/r)·(B·A)·x。
+
+    **A/B 恒为 float32，与被包的基座 dtype 无关**，这是有意的：AdamW 直接在 bf16 参数上
+    更新会让小步长在末位下溢，fp32 的低秩增量等价于给这部分参数配了 master weights。
+    代价是接 `--dtype bfloat16` 的底座时 x 是 bf16 而 A 是 fp32——训练侧有 autocast 兜着，
+    但评测/推理脚本全都不带 autocast，那里会直接抛
+    `RuntimeError: expected m1 and m2 to have the same dtype`。
+
+    所以 forward 里做一次 dtype 对齐，且对齐的是**权重侧**：A 是 (r,in)、B 是 (out,r)，
+    r=64/in=2560 时只有十几万元素，而 x 是 (B·T,in)（B=2/T=8704 时 4400 万），
+    转权重比转激活便宜两个数量级。dtype 本来就一致时两次判断都短路，
+    **全 fp32 的既有路径逐位不变**（见 tests/regression_dtype_paths.py）。
+    """
+
     def __init__(self, base: nn.Linear, r: int = 16, alpha: int = 32, dropout: float = 0.0):
         super().__init__()
         self.base = base
@@ -26,7 +40,11 @@ class LoRALinear(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.base(x) + (self.drop(x) @ self.A.t() @ self.B.t()) * self.scaling
+        out = self.base(x)
+        A = self.A if self.A.dtype == x.dtype else self.A.to(x.dtype)
+        B = self.B if self.B.dtype == x.dtype else self.B.to(x.dtype)
+        delta = (self.drop(x) @ A.t() @ B.t()) * self.scaling
+        return out + (delta if delta.dtype == out.dtype else delta.to(out.dtype))
 
 
 def _set_submodule(root: nn.Module, name: str, new: nn.Module) -> None:

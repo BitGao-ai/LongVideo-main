@@ -22,7 +22,8 @@ from cst_ssm.data import LoaderConfig, build_dataloader, cycle, align_feat_dim
 from cst_ssm.train import Trainer, TrainConfig, LossWeights
 from cst_ssm.utils import (model_config_from_dict, load_yaml,
                            train_config_from_yaml, loss_weights_from_yaml,
-                           loader_config_from_yaml)
+                           loader_config_from_yaml, add_ddp_args, resolve_ddp,
+                           require_model_config)
 
 
 def _pick(cli, yaml_val, fallback):
@@ -32,12 +33,15 @@ def _pick(cli, yaml_val, fallback):
     return yaml_val if yaml_val is not None else fallback
 
 
-def build_cfg(y: dict, manifest: str | None, data_root: str) -> CSTSSMConfig:
+def build_cfg(y: dict, manifest: str | None, data_root: str,
+              config_path: str | None = None, allow_default: bool = False) -> CSTSSMConfig:
     # 无论配置来自 YAML 还是脚本内置默认，都统一过一次 align_feat_dim：feat_dim 由抽特征
     # 的视觉塔唯一决定，不是可自由设定的建模超参。此前 YAML 带 model 段时直接 return，
     # 把特征维校验整段短路了（见 align_feat_dim 的 docstring）。
     if y.get("model"):
         return align_feat_dim(model_config_from_dict(y["model"]), manifest, data_root)
+    # 真实 manifest + 冒烟兜底配置 = 白跑一轮（d_model=96 到 stage-2 才暴露），入口拦掉
+    require_model_config(manifest, config_path, "scripts/train_stage1.py", allow_default)
     cfg = CSTSSMConfig(input_mode="feature", feat_dim=64, d_model=96, eacs_chunk=16,
                        llm=LLMConfig(vocab_size=259, dim=128, n_layer=4, n_head=4, max_len=64))
     return align_feat_dim(cfg, manifest, data_root)
@@ -56,17 +60,26 @@ def main():
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--mode", default=None, choices=["feature", "pixel"])
+    ap.add_argument("--allow-default-config", action="store_true",
+                    help="放行「真实 manifest + 无 --config」：用脚本内置冒烟尺寸配置"
+                         "（d_model=96）跑真实数据。仅用于验证数据管线——这样产出的"
+                         "检查点无法给 stage-2 热启（d_model 对不上会被整段丢弃）")
+    # DDP（torchrun 启动时必开；也可在 YAML 的 train: 段写 ddp: true）
+    add_ddp_args(ap)
     args = ap.parse_args()
 
     # ---- 配置解析：YAML 四段全部消费（model / train / loss / data），命令行覆盖 YAML ----
     y = load_yaml(args.config) if args.config else {}
+    # 尽早做：漏配 ddp 时立刻退出，而不是等 8 个进程挤爆 cuda:0 才 OOM
+    ddp, ddp_backend = resolve_ddp(args.ddp, args.ddp_backend, y.get("train"),
+                                   "scripts/train_stage1.py", device=args.device)
     ydata = y.get("data") or {}
     val_manifest = _pick(args.val_manifest, ydata.get("val_manifest"), None)
     manifest = _pick(args.manifest, ydata.get("manifest"), None)
     data_root = _pick(args.data_root, ydata.get("data_root"), "")
     mode = _pick(args.mode, ydata.get("mode"), "feature")
 
-    cfg = build_cfg(y, manifest, data_root)
+    cfg = build_cfg(y, manifest, data_root, args.config, args.allow_default_config)
     model = CSTSSMModel(cfg)
 
     tc = train_config_from_yaml(y, skip={"stage", "device", "bf16", "eacs_chunk"})
@@ -78,6 +91,7 @@ def main():
     tc.max_steps = steps
     tc.ckpt_dir = _pick(args.ckpt, None, tc.ckpt_dir if y.get("train") else "checkpoints/stage1")
     tc.eacs_chunk = None            # 沿用模型配置，理由同 train_stage2
+    tc.ddp, tc.ddp_backend = ddp, ddp_backend
 
     batch_size = _pick(args.batch_size, ydata.get("batch_size"), 2)
     num_workers = _pick(args.num_workers, ydata.get("num_workers"), 0)

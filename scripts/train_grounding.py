@@ -26,7 +26,8 @@ from cst_ssm.data import LoaderConfig, build_dataloader, cycle, align_feat_dim
 from cst_ssm.train import Trainer, TrainConfig
 from cst_ssm.utils import (model_config_from_dict, load_yaml,
                            train_config_from_yaml, loss_weights_from_yaml,
-                           loader_config_from_yaml)
+                           loader_config_from_yaml, add_ddp_args, resolve_ddp,
+                           require_model_config)
 
 
 def _pick(cli, yaml_val, fallback):
@@ -64,18 +65,52 @@ def build_model(cfg: CSTSSMConfig, args):
     # 前缀——grounding_head / vision / temporal / projector 仍可训，无需再手工放开。
     model = build_cstssm_qwen3vl(
         model_name=args.base_model, base_cfg=cfg, lora=args.lora,
-        lora_r=args.lora_r, lora_alpha=args.lora_alpha, dtype=args.dtype)
+        lora_r=args.lora_r, lora_alpha=args.lora_alpha, dtype=args.dtype,
+        device_map=resolve_device_map(args))
     print(f"[tokenizer] 加载 Qwen3-VL 分词器: {args.base_model}")
     return model, build_hf_tokenizer(args.base_model, max_video_tokens=args.max_video_tokens)
 
 
-def build_cfg(y, manifest, data_root) -> CSTSSMConfig:
+def resolve_device_map(args):
+    """--load-to-device 的解析与互锁。返回给 build_cstssm_qwen3vl 的 device_map 或 None。
+
+    互锁的理由不是保守：本脚本刻意把「fork DataLoader worker」排在「CUDA 初始化」之前
+    （见下方预热那一段），而 device_map 会在加载底座时就建起 CUDA 上下文，fork 出的子进程
+    会继承它。本仓库的 worker 只产出 CPU 张量，实测不会崩，但那是 PyTorch 明确警告的用法，
+    所以 num_workers>0 时要出声，让人知道自己在用哪条路。
+    """
+    if not getattr(args, "load_to_device", False):
+        return None
+    dev = args.device
+    if not str(dev).startswith("cuda"):
+        print(f"[model] --load-to-device 对 device={dev!r} 无意义，已忽略")
+        return None
+    import torch
+    if not torch.cuda.is_available():
+        print("[model] --load-to-device: CUDA 不可用，已忽略")
+        return None
+    from cst_ssm.utils import resolve_device
+    dev = resolve_device(dev)                 # "cuda" -> "cuda:{LOCAL_RANK}"
+    nw = getattr(args, "num_workers", 0) or 0
+    if nw > 0:
+        print(f"[model] ⚠ --load-to-device 与 --num-workers {nw} 同时开启：底座直接落 {dev} 会在 "
+              f"fork worker 之前初始化 CUDA。本仓库的 worker 只产出 CPU 张量，实践中可用，"
+              f"但这是 PyTorch 警告过的组合——若出现 worker 卡死/CUDA 重初始化报错，"
+              f"请去掉 --load-to-device 或改用 --num-workers 0。")
+    print(f"[model] 底座权重直接加载到 {dev}（device_map）")
+    return {"": dev}
+
+
+def build_cfg(y, manifest, data_root, config_path=None, allow_default=False) -> CSTSSMConfig:
     # 两条分支都过 align_feat_dim，理由同 train_stage1.build_cfg：feat_dim 由抽特征的
     # 视觉塔唯一决定，YAML 带 model 段时也不能跳过校验。
     if y.get("model"):
         d = dict(y["model"])
         d["grounding_head"] = True                     # 定位训练必须开头
         return align_feat_dim(model_config_from_dict(d), manifest, data_root)
+    # 真实定位 manifest + 冒烟兜底配置：--load 的 stage-2 权重会因 d_model 对不上被整段
+    # 丢弃，定位头就架在一个随机初始化的主干上——曲线照常收敛，指标却是废的。入口拦掉
+    require_model_config(manifest, config_path, "scripts/train_grounding.py", allow_default)
     cfg = CSTSSMConfig(input_mode="feature", feat_dim=64, d_model=96, grounding_head=True,
                        eacs_chunk=16,   # 定位训练走 run_with_commits，同样按块做梯度检查点
                        llm=LLMConfig(vocab_size=259, dim=128, n_layer=2, n_head=4, max_len=64))
@@ -93,6 +128,8 @@ def main():
                     help="HF Video-LLM 底座名（如 Qwen/Qwen3-VL-4B-Instruct）。"
                          "不给则 query 嵌入来自随机初始化的 stand-in，定位头学不到 query 区分度")
     ap.add_argument("--dtype", default=None, help="底座 dtype（如 bfloat16），缺省自动")
+    ap.add_argument("--load-to-device", action="store_true",
+                    help="直接把底座权重加载到本 rank 的卡（HF device_map），省掉「先在 CPU 物化 8.8GB 再 .to(cuda)」这一趟。⚠ 它会在 fork DataLoader worker 之前建起 CUDA 上下文，与本脚本刻意安排的顺序冲突，故默认关闭；配 --num-workers 0 时最安全")
     ap.add_argument("--max-video-tokens", type=int, default=8192)
     ap.add_argument("--lora", action="store_true", default=None,
                     help="LoRA 冻结基座，只训头+投影（真底座默认开）")
@@ -102,20 +139,34 @@ def main():
     ap.add_argument("--load", default=None, help="从 stage-2 检查点热启（复用视觉/时序/LLM）")
     ap.add_argument("--manifest", default=None, help="含 gt_start/gt_end 的定位 manifest；缺省合成")
     ap.add_argument("--data-root", default=None)
+    ap.add_argument("--allow-default-config", action="store_true",
+                    help="放行「真实 manifest + 无 --config」：用脚本内置冒烟尺寸配置"
+                         "（d_model=96）跑真实数据。仅用于验证数据管线——此时 --load "
+                         "的 stage-2 权重会因 d_model 对不上被整段丢弃")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None, help="覆盖 YAML train.lr")
+    # DDP（torchrun 启动时必开；也可在 YAML 的 train: 段写 ddp: true）
+    add_ddp_args(ap)
     args = ap.parse_args()
 
     # ---- 配置解析：YAML 四段全部消费（model / train / loss / data），命令行覆盖 YAML ----
     y = load_yaml(args.config) if args.config else {}
+    # 尽早做：这一步在加载 4B 底座之前，漏配 ddp 时立刻退出而不是先白load 8 份权重
+    ddp, ddp_backend = resolve_ddp(args.ddp, args.ddp_backend, y.get("train"),
+                                   "scripts/train_grounding.py", device=args.device)
     ydata = y.get("data") or {}
     manifest = _pick(args.manifest, ydata.get("manifest"), None)
     data_root = _pick(args.data_root, ydata.get("data_root"), "")
+    # batch_size / num_workers 提前解析：--load-to-device 的互锁要在**加载底座之前**
+    # 知道真实的 worker 数（args.num_workers 可能是 None，真值在 YAML 的 data 段里）。
+    batch_size = _pick(args.batch_size, ydata.get("batch_size"), 2)
+    num_workers = _pick(args.num_workers, ydata.get("num_workers"), 0)
+    args.num_workers = num_workers
     if args.lora is None:      # 未显式指定：真底座默认开 LoRA，stand-in 默认关
         args.lora = bool(args.base_model)
 
-    cfg = build_cfg(y, manifest, data_root)
+    cfg = build_cfg(y, manifest, data_root, args.config, args.allow_default_config)
     model, tokenizer = build_model(cfg, args)
     if args.base_model and model.cfg.feat_dim != cfg.feat_dim:
         sys.exit(
@@ -143,9 +194,8 @@ def main():
     tc.ckpt_dir = _pick(args.ckpt, None,
                         tc.ckpt_dir if y.get("train") else "checkpoints/grounding")
     tc.eacs_chunk = None            # 沿用模型配置，理由同 train_stage2
+    tc.ddp, tc.ddp_backend = ddp, ddp_backend
 
-    batch_size = _pick(args.batch_size, ydata.get("batch_size"), 2)
-    num_workers = _pick(args.num_workers, ydata.get("num_workers"), 0)
     lc = loader_config_from_yaml(
         y, skip={"manifest", "val_manifest", "data_root", "mode", "batch_size",
                  "num_workers", "pin_memory", "drop_last", "persistent_workers"})

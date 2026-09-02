@@ -34,12 +34,23 @@ model:
     # 8×80G：可改 false 换约 30% 速度，但 batch_size 要相应下调；显存宽裕时
     #        更划算的用法是保持 true 并把 batch_size 提到 4~8。
     grad_checkpoint: true
+    # ---- 显存主开关之三：LM 头 logits 分块（长视频 + 大词表的真正天花板）----
+    # 一次性算 (B,T,V) 的 logits 再求 CE，峰值约 B·T·V×12 字节（bf16 logits + reshape
+    # 复制 + autocast 提升到 fp32 + log_softmax 存反向）。Qwen3-VL 的 V=151936：
+    #     B=1/T=2048 → 3.7GB      B=1/T=8192 → 14.9GB      B=2/T=8192 → 29.9GB
+    # 最后这个数比 4B 底座权重（~8.5GB）还大，加起来 38.4GB，40G 卡上激活无处安放。
+    # 分块后峰值 = loss_chunk·V×10（1024 时约 1.5GB）且**与 T 无关**，B=2/T=8192 才可行。
+    # 只在训练时生效；推理/验证仍走一次性路径（那里 logits 有消费者且无反向图）。
+    # 0 = 关闭。数值等价但非逐位（fp32 分段求和，末位 ~1e-7 相对差）。
+    loss_chunk: 1024
 
 train:
   stage: finetune            # finetune | pretrain
   lr: 1.0e-4
   weight_decay: 0.05
   grad_accum: 4              # 梯度累积省显存
+  # ⚠ max_steps 数的是**微批**不是优化步：grad_accum=4 时 max_steps=20000
+  #   实际只有 5000 次参数更新。
   max_steps: 1000
   grad_clip: 1.0
   bf16: true
@@ -48,6 +59,22 @@ train:
   t_end: 0.05
   ckpt_dir: checkpoints
   ckpt_every: 500
+  # ---- 检查点：是否只存可训练权重 ----
+  # 留空(null)=自动：冻结权重能从外部来源重新取回时才省。
+  #   · Qwen3-VL + LoRA → 自动判为 true。基座下次 from_pretrained 原样拿回，存它纯属浪费：
+  #     4B bf16 ≈ 8.8GB/次，ckpt_every=500 跑 5000 步 ≈ 88GB 磁盘；可训练部分只 ≈600MB。
+  #   · stand-in + LoRA → 自动判为 false。那时被冻的是**随机初始化**的 stand-in 基座，
+  #     没有外部来源能复现，丢了检查点就废了。
+  # 只在明确知道自己在做什么时才显式写 true/false。
+  save_trainable_only: null
+  # ---- 单机多卡（torchrun）----
+  # 用 torchrun 启动时**必须**为 true，否则脚本会直接报错退出（防止 8 个进程挤 cuda:0）。
+  # 单卡训练保持 false：此时全部分布式代码路径都不会被触碰，行为与单卡完全一致。
+  # 命令行 --ddp / --no-ddp 优先于本项。
+  # ⚠ 多卡时 --device 必须写 cuda（不带序号）：写死 cuda:0 会让多个进程挤同一张卡，
+  #   现在脚本会在加载底座之前就报错退出，而不是给你一句无关的 OOM。
+  ddp: false
+  ddp_backend: nccl          # nccl(GPU) | gloo(CPU 多进程冒烟测试)
 
 loss:
   task: 1.0
@@ -62,6 +89,15 @@ data:
   mode: feature              # feature | pixel
   max_frames: 8192           # 单样本最大帧数（保险丝，非日常预算）；与 SamplerConfig 对齐
   max_text_len: 8704         # 文本最大 token 数；须 ≥ max_frames + prompt 文本
+  # ---- 特征张量 dtype（显存主开关之四）----
+  # auto（默认）= 沿用特征文件自身的 dtype。特征在磁盘上是 float16，此前数据侧取出后
+  # 立刻 .float() 升到 float32，而下游第一个算子是 autocast(bf16) 下的 Linear，
+  # 无论如何都会把它降到 bf16 —— 那份 float32 全程没有消费者，只是让 worker RSS /
+  # pinned buffer / H2D 带宽 / GPU 常驻 batch 全部翻倍。实测占整步留存的 21%，
+  # B=2/L=8192/P=9/d=2560 约 755MB。数值零代价（fp16→fp32 无损，故两条路降到 bf16 后
+  # 逐位相同）；不带 autocast 的评测/推理路径由 FeatureAdapter 入口升精度兜底，
+  # 结果与旧行为逐位相同。写 float32 可恢复旧行为。
+  feat_dtype: auto           # auto | float16 | bfloat16 | float32
   batch_size: 2              # 生产建议 8~16（配合 grad_accum）
   num_workers: 0             # 生产建议 8
   pin_memory: false          # GPU 训练时建议 true

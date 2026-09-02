@@ -13,7 +13,7 @@ import torch.utils.checkpoint as ckpt
 from torch import Tensor
 
 from ..ops.spectral_init import BranchSpec, DEFAULT_BRANCHES
-from .eacs import EACSLayer, EACSOutput, StepParams, scan_range
+from .eacs import EACSLayer, EACSOutput, StepParams, scan_range, _write_chunk
 from .event_gate import EventGate
 
 
@@ -56,6 +56,37 @@ class MultiScaleEACS(nn.Module):
             persistent=False)
 
     # ---- 分支并轴扫描（吞吐主开关）----
+    def merge_status(self) -> tuple[bool, str]:
+        """并轴扫描在**当前配置**下能否启用，以及不能的原因。只查与输入无关的条件。
+
+        存在的理由：这条路是为吞吐写的（三个 Python 逐帧循环并成一个，单步耗时里约 90%
+        花在扫描的调度上），但它要求各分支状态维 N 相同——而 DEFAULT_BRANCHES 是
+        16/32/64，所以**默认配置下它一次都不会启用**。这件事从任何日志里都看不出来，
+        于是"已经做了并轴优化"会变成一个不成立的假设。Trainer 启动时打印本函数的结果。
+
+        统一 n_state 能拿到这条路，但那会改变各分支的容量与谱覆盖，属建模决策
+        （需要消融支撑），不能当成一次纯优化顺手改掉。
+        """
+        brs = self.branches
+        if len(brs) < 2:
+            return False, "只有一个分支"
+        b0 = brs[0]
+        ns = sorted({b.N for b in brs})
+        if len(ns) > 1:
+            return False, (f"各分支状态维 N 不同（{ns}）——默认 DEFAULT_BRANCHES 就是 "
+                           f"16/32/64，这是最常见的原因；要启用需统一 n_state（建模决策）")
+        if len({b.H for b in brs}) > 1:
+            return False, "各分支通道数 H 不同"
+        if b0.disc_mode == "learned":
+            return False, "disc_mode=learned（各分支有独立的 proj_dt）"
+        if b0.gate.gate_kind == "random":
+            return False, "gate_kind=random（并轴会改变 RNG 取用顺序）"
+        if any(b.robust_guard for b in brs):
+            return False, "robust_guard 开启（spike 计数是逐分支状态机）"
+        if any(b.fused_train for b in brs):
+            return False, "eacs_fused_train 开启（可微融合快路优先，比并轴更快）"
+        return True, "可用（训练时若走逐帧扫描即生效）"
+
     def _merge_ok(self, x: Tensor) -> bool:
         """三个分支能不能并进一个 Python 逐帧循环？
 
@@ -141,13 +172,17 @@ class MultiScaleEACS(nn.Module):
 
         cs = b0.chunk_size
         if b0.training and cs and cs > 0 and L > cs:
-            ys_all, gs_all, rs_all = [], [], []
+            # 同 EACSLayer.forward：写进预分配缓冲而非 append+cat（逐位等价，省一次翻倍）
+            ys = gs = rs = None
             for k0 in range(0, L, cs):
-                ys, gs, rs, state = ckpt.checkpoint(
-                    scan_range, p, state, u, Bc, Cc, t, k0, min(k0 + cs, L), cpi_s,
+                k1 = min(k0 + cs, L)
+                y_c, g_c, r_c, state = ckpt.checkpoint(
+                    scan_range, p, state, u, Bc, Cc, t, k0, k1, cpi_s,
                     None, use_reentrant=False)
-                ys_all.append(ys); gs_all.append(gs); rs_all.append(rs)
-            ys = torch.cat(ys_all, 1); gs = torch.cat(gs_all, 1); rs = torch.cat(rs_all, 1)
+                ys = _write_chunk(ys, y_c, L, k0, k1)
+                gs = _write_chunk(gs, g_c, L, k0, k1)
+                rs = _write_chunk(rs, r_c, L, k0, k1)
+                del y_c, g_c, r_c
         else:
             ys, gs, rs, _ = scan_range(p, state, u, Bc, Cc, t, 0, L, cpi=cpi_s)
 
@@ -176,6 +211,12 @@ class MultiScaleEACS(nn.Module):
         else:
             outs = [br(x, timestamps, cpi=cpi, frame_mask=frame_mask)
                     for br in self.branches]
+        # 这里刻意保留 stack + einsum，**不改成逐分支加权累加**。
+        # 累加式确实能省掉 deltas 这份复制（B=2/L=8192/d=768 的 bf16 约 75MB，是一份
+        # 纯复制：各分支的 o.y 本来就都在世），但实测两者**不是逐位相同**
+        # （max|Δ|=2.4e-7，einsum 走 bmm 的归约顺序与顺序累加不同）。
+        # 本行在 QA / 预训练 / 定位三条路的主干上，逐位可复现比这几十 MB 重要得多，
+        # 故维持原样。真要省这一份，应连同 tests/_baseline_snapshot.py 一起重做基线。
         deltas = torch.stack([o.y for o in outs], dim=-1)          # (B,L,d,n_branch)
         w = torch.softmax(self.fusion(x), dim=-1)                  # (B,L,n_branch)
         fused = torch.einsum("bldn,bln->bld", deltas, w)

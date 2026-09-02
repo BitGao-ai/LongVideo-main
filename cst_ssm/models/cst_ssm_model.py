@@ -44,9 +44,14 @@ class CSTSSMConfig:
     #     chunk=0  → 5.32 MB/帧/样本      chunk=32 → 0.52 MB/帧/样本（约 1/10）
     #     代价：单步 1669ms → 2064ms（+24%，反向重算一遍块内前向）
     #   L=512、batch=8 时就是 21.8 GB vs 2.1 GB 的差别——长视频训练几乎总要开。
-    #   默认取 32 而不是 0：本模型的目标场景就是长视频，"默认能跑通"比"默认最快"重要；
-    #   数值上与 chunk=0 **逐位相同**（loss/update_rate/全部参数梯度实测 Δ=0，含
-    #   robust_guard 开启时），所以打开它不改变任何结果，只换时间省显存。
+    #   默认取 32 而不是 0：本模型的目标场景就是长视频，"默认能跑通"比"默认最快"重要。
+    #   **数值：loss / update_rate 与 chunk=0 逐位相同；梯度只有 λ 的两个参数
+    #   （a_log_neg_real / a_imag）有 fp32 末位差（实测相对 1e-7 ~ 2e-5），其余全部逐位相同。**
+    #   原因是 λ 在分块循环**外**算一次、作为输入传进每个 checkpoint，于是它的梯度按块
+    #   累加，而不分块时是一次归约——浮点加法不满足结合律，顺序不同末位就不同。
+    #   这不是缺陷（λ 本身是 (H,N) 的小参数、量级远大于该差异），但别把它当成"逐位等价"
+    #   写进对拍断言：并轴路径（各分支 n_state 相同）与定位路径实测**确实**逐位相同，
+    #   只有默认的逐分支路径有这一项差异。见 tests/regression_waste_20260824.py。
     #   显式设 0 可关闭（tests/_baseline_snapshot.py 就这么做，以隔离检查点变量）。
     #   见 tests/profile_memory.py 复现这两组数字。
     eacs_fused_train: bool = False     # True：EACS 训练走可微融合 cell（常数图显存）
@@ -139,6 +144,9 @@ class CSTSSMModel(nn.Module):
 
         # 段 4：LLM。可注入外部 LLM（如 Qwen3-VL），否则用自包含 stand-in
         self.llm = llm if llm is not None else VisualConditionedLM(cfg.llm)
+        # 注入的 LLM 是否吃 need_logits 关键字（懒探测一次，见 _llm_takes_need_logits）。
+        # 普通属性，不进 state_dict。
+        self._llm_need_logits: bool | None = None
 
         # stage-1 自监督：未来帧特征预测 + 掩码帧重构
         self.pred_head = nn.Linear(d, d)
@@ -220,19 +228,25 @@ class CSTSSMModel(nn.Module):
         return feat, ms, cpi_frame, cpi_tokens, tokens
 
     # ---------- 统一前向入口（stage 分派）----------
-    def forward(self, batch: dict, stage: str = "finetune") -> dict:
+    def forward(self, batch: dict, stage: str = "finetune",
+                need_logits: bool = True) -> dict:
         """所有训练/推理阶段的**唯一**入口。
 
         必须走 forward 而不是直接调 pretrain_forward/grounding_forward：
         DistributedDataParallel 不代理自定义方法名（会 AttributeError），更要命的是即使
         用 .module 绕过属性问题，绕开 DDP.forward 就不会挂上反向的 all-reduce hook——
         各卡梯度不同步，多卡训练静默退化成 N 个独立单卡训练，且不会有任何报错。
+
+        need_logits: 调用方是否会读 out["logits"]。只对 finetune 阶段有意义
+        （pretrain / grounding 都不经过 LLM 头）。给 False 时 no_grad 下也走分块 CE，
+        省掉一份 (B,T,V)——Trainer.validate 就是这么调的，见
+        llm_interface.use_chunked_loss。默认 True = 既有调用方行为逐字不变。
         """
         if stage == "pretrain":
             return self.pretrain_forward(batch)
         if stage == "grounding":
             return self.grounding_forward(batch)
-        return self.finetune_forward(batch)
+        return self.finetune_forward(batch, need_logits=need_logits)
 
     # ---------- 段 1+2+3：视觉 → 时序 → 投影（喂给 LLM 的 visual_states）----------
     def encode_visual(self, batch: dict):
@@ -251,7 +265,25 @@ class CSTSSMModel(nn.Module):
                                    cpi_tokens=cpi_tokens, tokens=tokens)
 
     # ---------- 端到端任务前向（stage-2 / 推理）----------
-    def finetune_forward(self, batch: dict) -> dict:
+    def _llm_takes_need_logits(self) -> bool:
+        """注入的 LLM 是否接受 need_logits 关键字。结果缓存，只反射一次。
+
+        本类明确支持"换任意骨干"（见 llm_interface.LLMBackbone），而 need_logits 是后加的
+        关键字。外部包装器可能停留在旧签名上，无条件传会让它当场 TypeError——那不是
+        调用方的错，所以这里探一次签名，不认就不传（退回旧行为：no_grad 下物化 logits）。
+        """
+        if self._llm_need_logits is None:
+            import inspect
+            try:
+                params = inspect.signature(self.llm.forward).parameters
+                self._llm_need_logits = (
+                    "need_logits" in params
+                    or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()))
+            except (TypeError, ValueError):      # 无法反射（C 扩展等）→ 保守不传
+                self._llm_need_logits = False
+        return self._llm_need_logits
+
+    def finetune_forward(self, batch: dict, need_logits: bool = True) -> dict:
         visual_states, aux = self.encode_visual(batch)
         feat, ms = aux["feat"], aux["ms"]
         cpi_frame, cpi_tokens, tokens = aux["cpi_frame"], aux["cpi_tokens"], aux["tokens"]
@@ -273,6 +305,7 @@ class CSTSSMModel(nn.Module):
             attention_mask=batch.get("attention_mask"),
             visual_mask=batch.get("frame_mask"),
             labels=batch.get("labels"),
+            **({"need_logits": need_logits} if self._llm_takes_need_logits() else {}),
         )
         out.update(
             update_rate=ms.update_rate,

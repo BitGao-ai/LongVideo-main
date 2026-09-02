@@ -188,6 +188,23 @@ def scan_range(p: StepParams, state, u, Bc, Cc, t, k0, k1,
 
 
 
+def _write_chunk(dst, part, total: int, k0: int, k1: int):
+    """把一块结果写进沿时间轴预分配好的缓冲；dst 为 None 时按 part 的形状先开出来。
+
+    替代"先把各块 append 进 list、最后 torch.cat"的写法。cat 的那一瞬间**新旧两份同时
+    在世**，峰值是结果的两倍；而这里每块写完就可以释放，峰值 = 结果 + 一块。
+    对 run_with_commits 尤其要紧：那里要拼的是 (B,L,H,N) 复数提交轨迹，
+    B=2/L=4096/H=768/N=64 单份就 3.2 GB，cat 的瞬时翻倍是 6.4 GB。
+
+    纯数据搬运，无任何算术，因此前向与全部梯度都与 cat 逐位相同（在 autograd 下、
+    含梯度检查点、含复数 dtype 均已对拍验证，见 tests/regression_waste_20260824.py）。
+    """
+    if dst is None:
+        dst = part.new_empty(part.shape[0], total, *part.shape[2:])
+    dst[:, k0:k1] = part
+    return dst
+
+
 class EACSLayer(nn.Module):
     """单个尺度分支的 EACS 层（pre-LN 残差块）。
 
@@ -392,15 +409,18 @@ class EACSLayer(nn.Module):
 
         cs = self.chunk_size
         if self.training and cs and cs > 0 and L > cs:
-            # 分块梯度检查点：只保存块边界状态，块内重算 → 省激活显存
-            ys_all, gs_all, rs_all = [], [], []
+            # 分块梯度检查点：只保存块边界状态，块内重算 → 省激活显存。
+            # 结果写进预分配缓冲而非 append+cat，见 _write_chunk（逐位等价，省一次翻倍）。
+            ys = gs = rs = None
             for k0 in range(0, L, cs):
                 k1 = min(k0 + cs, L)
-                ys, gs, rs, state = ckpt.checkpoint(
+                y_c, g_c, r_c, state = ckpt.checkpoint(
                     self._scan_range, lam, state, u, Bc, Cc, t, k0, k1, cpi,
                     use_reentrant=False)
-                ys_all.append(ys); gs_all.append(gs); rs_all.append(rs)
-            ys = torch.cat(ys_all, 1); gs = torch.cat(gs_all, 1); rs = torch.cat(rs_all, 1)
+                ys = _write_chunk(ys, y_c, L, k0, k1)
+                gs = _write_chunk(gs, g_c, L, k0, k1)
+                rs = _write_chunk(rs, r_c, L, k0, k1)
+                del y_c, g_c, r_c
         else:
             ys, gs, rs, state = self._scan_range(lam, state, u, Bc, Cc, t, 0, L, cpi=cpi)
 
@@ -491,14 +511,18 @@ class EACSLayer(nn.Module):
         chunked = (torch.is_grad_enabled() and cs and cs > 0 and L > cs
                    and use_chunk is not False)
         if chunked:
-            parts = []
+            # 同 forward：结果写进预分配缓冲，避免 cat 那一瞬间的峰值翻倍。
+            # 这条路上翻倍的代价最大——要拼的是 (B,L,H,N) 复数提交轨迹，
+            # B=2/L=4096/H=768/N=64 单份 3.2 GB。
+            bufs = [None] * 8
             for k0 in range(0, L, cs):
+                k1 = min(k0 + cs, L)
                 out = ckpt.checkpoint(self._commit_range, lam, state, u, Bc, Cc, t,
-                                      k0, min(k0 + cs, L), cpi, use_reentrant=False)
-                parts.append(out)
+                                      k0, k1, cpi, use_reentrant=False)
                 state = tuple(o[:, -1] for o in out[3:])   # 末帧提交 = 下一块初始 state
-            ys, gs, rs, H, T, U, Bs, Cs = [
-                torch.cat([p[i] for p in parts], 1) for i in range(8)]
+                bufs = [_write_chunk(bufs[i], out[i], L, k0, k1) for i in range(8)]
+                del out
+            ys, gs, rs, H, T, U, Bs, Cs = bufs
         else:
             ys, gs, rs, H, T, U, Bs, Cs = self._commit_range(
                 lam, state, u, Bc, Cc, t, 0, L, cpi)

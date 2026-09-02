@@ -18,6 +18,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .schema import DataConfig
+from ..dtypes import resolve_feat_dtype
 
 
 class ByteTokenizer:
@@ -47,6 +48,23 @@ class VideoTemporalDataset(Dataset):
         self._pixel = (cfg.mode == "pixel")
         self._n_fail = 0        # 取样失败次数（含被成功替换的）
         self._n_fallback = 0    # 返回零特征占位样本的次数
+        # None = 沿用特征文件自身 dtype（默认，见 DataConfig.feat_dtype）
+        self._feat_dtype = resolve_feat_dtype(getattr(cfg, "feat_dtype", "auto"))
+        self._warned_npz = False
+
+    def _cast_feat(self, t: torch.Tensor) -> torch.Tensor:
+        """按 cfg.feat_dtype 决定特征 dtype。
+
+        "auto"（默认）只对**下游确实吃得下的低精度浮点**放行：float16 / bfloat16 / float32
+        原样返回（零拷贝）。其余一律回落到 float32，也就是旧的 `.float()` 行为——
+        第三方特征若存成 float64 或 uint8，autocast 与 nn.Linear 的处理各不相同，
+        "沿用文件 dtype" 在那里不是省显存而是埋雷。
+        """
+        if self._feat_dtype is not None:
+            return t if t.dtype == self._feat_dtype else t.to(self._feat_dtype)
+        if t.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            return t
+        return t.float()
 
     def __len__(self):
         return len(self.rows)
@@ -55,15 +73,33 @@ class VideoTemporalDataset(Dataset):
         """读特征与时间戳。
         - ref 以 .npy 结尾：真内存映射（惰性按索引读盘），时间戳取同名 <stem>.ts.npy；
         - ref 以 .npz 结尾：注意 mmap 对 zip 归档无效，会整载解压该成员（大特征建议改用分离 .npy）。
-        保留 float16 存储，索引后再由调用方转 float32（省一半内存）。
+        特征 dtype 由 cfg.feat_dtype 决定，默认沿用文件自身（fp16 存就 fp16 用）。
         """
         path = os.path.join(self.root, ref)
         if ref.endswith(".npy"):
             feats = np.load(path, mmap_mode="r")               # 惰性 mmap
             ts = np.load(path[:-4] + ".ts.npy")
             return feats, np.asarray(ts, dtype=np.float32)
+        self._warn_npz(ref)
         z = np.load(path)                                      # .npz 整载解压
         return z["features"], np.asarray(z["timestamps"], dtype=np.float32)
+
+    def _warn_npz(self, ref: str) -> None:
+        """.npz 无法 mmap —— 规模化训练前必须转 .npy，这里出声提醒一次。
+
+        每个 worker 各喊一次（每个 worker 是独立进程，各有一份实例）就够了：多卡训练下
+        8 rank × 8 worker = 64 个进程**各自**整载解压每个样本的全部特征，单样本
+        L=4096/P=9/d=2560 的 fp16 就是 189 MB，几十个在世样本足以吃掉几十 GB 主机内存。
+        转成 .npy + .ts.npy 后 mmap_mode='r' 生效，只读被 _subsample 选中的那些帧。
+        """
+        if self._warned_npz:
+            return
+        self._warned_npz = True
+        print(f"[dataset] 提示: 特征是 .npz（{ref}），np.load 的 mmap 对 zip 归档无效，"
+              f"每次取样都要整载解压该视频的全部特征。多卡/长视频训练前请先转格式：\n"
+              f"[dataset]   python -m data_pipeline.src.npz_to_npy --in <npz目录> "
+              f"--out <npy目录> [--shard-dirs]\n"
+              f"[dataset]   再用 build_manifest.py --prefer-npy 让 feature_ref 指向 .npy。")
 
     def _load_pixel_frames(self, frame_dir: str):
         """像素模式：从帧图目录加载帧（按文件名排序），返回 (frames[L,C,H,W], ts[L])。
@@ -155,7 +191,14 @@ class VideoTemporalDataset(Dataset):
         else:
             feats, ts = self._load_feature(r["feature_ref"])
             idx = self._subsample(len(ts))
-            vis = torch.from_numpy(feats[idx]).float()     # (L,P,d)
+            # 不再无条件 .float()：磁盘上是 fp16，而下游第一个算子（FeatureAdapter 的
+            # Linear）在 autocast(bf16) 下无论如何都会降到 bf16，那份 fp32 全程没有消费者。
+            # dtype 由 cfg.feat_dtype 决定（默认 auto=沿用文件自身），不带 autocast 的路径
+            # 由 FeatureAdapter 入口的 align_to_param 升精度兜底，结果与旧行为逐位相同。
+            # np.ascontiguousarray：mmap 下 feats[idx] 已是新数组，但 .npz 路径下可能是
+            # 非连续视图，torch.from_numpy 要求连续。
+            vis = torch.from_numpy(np.ascontiguousarray(feats[idx]))   # (L,P,d)
+            vis = self._cast_feat(vis)
             ts = torch.from_numpy(ts[idx]).float()         # (L,)
 
         # 若分词器支持（HFTokenizer），告知当前帧数 Lv 以展开 <video> 占位符（对齐 _scatter_visual）

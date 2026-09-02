@@ -45,5 +45,14 @@ class DataConfig:
     max_text_len: int = 8704
     feat_patches: int = 1                # 每帧 patch 数 P
     feat_dim: int = 768
+    # 特征张量的 dtype。"auto"（默认）= **沿用特征文件自身的 dtype**。
+    # 特征在磁盘上是 float16（extract_features.py 的 astype(np.float16)），此前这里取出后
+    # 立刻 .float() 升到 float32——而可训练路径的第一个算子是 autocast(bf16) 下的 Linear，
+    # 无论如何都会把它降到 bf16，那份 float32 全程没有消费者，只是让 worker RSS / pinned
+    # buffer / H2D 带宽 / GPU 常驻 batch 全部翻倍（实测占整步留存 21%，B=2/L=8192 约 755MB）。
+    # 数值零代价：float16→float32 无损，故 fp32→bf16 与 fp16→bf16 逐位相同（已实测）。
+    # 不带 autocast 的路径（评测/推理脚本）由 FeatureAdapter 入口处升精度兜底，结果与旧行为
+    # 逐位相同。显式写 "float32" 可恢复旧的"取出即升精度"行为。
+    feat_dtype: str = "auto"             # auto | float16 | bfloat16 | float32
     frame_size: int = 224                # pixel 模式帧分辨率
     pad_frame_value: float = 0.0
