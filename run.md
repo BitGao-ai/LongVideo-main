@@ -328,6 +328,11 @@ stage-2 / grounding 传了 `--load` 之后，**第一件事是读这行日志**�
 > 从未训练过 projector。丢掉零损失。
 >
 > `vision.*` / `temporal.*` 形状不匹配则是**致命的**：那是 CST-SSM 主干，意味着热启白做。
+>
+> ⚠ 上面日志里的分母 **1305 是释放视觉塔之前的旧基线**。`build_cstssm_qwen3vl`
+> 现在会删掉 `model.visual`（见 [§8.5](#8-已知问题)），stage-2 的 `state_dict` 不再含
+> `visual.*`，故**总张量数与「缺失」数会同步下降**（那些视觉塔权重本就由 HF 提供、
+> 旧日志里被计作缺失）。**「命中 ≈81」不受影响**——那是 CST-SSM 段，与视觉塔无关。
 
 反例（本项目实际踩过的）：
 
@@ -550,7 +555,7 @@ torchrun --standalone --nproc_per_node=8 scripts/train_qwen3vl.py --ddp \
 
 | 项 | 估算 | 说明 |
 |---|---|---|
-| 底座权重 bf16 | ~8.5 GB | 含未参与训练的视觉塔（特征是离线抽的），见 §8.5 |
+| 底座权重 bf16 | ~8.5 GB | 已释放未参与训练的视觉塔（特征是离线抽的），见 §8.5；实际常驻略低于此估算 |
 | EACS 激活 | ~8.5 GB | 0.52 MB/帧/样本 × 8192 × 2，**修复后的第一大项** |
 | LLM 逐层检查点激活 | ~4.5 GB | 36 层 × B × T × 2560 × 2B + 单层重算峰值 |
 | LoRA 梯度 + 优化器 | ~2.5 GB | 装了 bitsandbytes 走 8bit Adam 可降到 ~1.3 GB |
@@ -641,14 +646,22 @@ step 行各项的判读：
    从未训练的 stand-in LLM 张量一并存下，于是每次热启固定产生几十条「多余(被忽略)」
    告警。属噪声，不影响正确性。
 
-5. **视觉塔白占显存**：`build_cstssm_qwen3vl` 加载完整
-   `Qwen3VLForConditionalGeneration`，但训练只用到解码器与 LM 头（帧特征是离线抽好的），
-   `model.visual` 在 8 张卡上各占一份、DDP 建图时被广播一次、每个检查点都写进去。
-   未修：拆掉它要动 `from_pretrained` 的加载路径与 `state_dict` 键名，会让
-   [§2 热启自检](#2-热启自检必看) 的命中数基线全部失效，风险大于收益。
+5. **视觉塔白占显存**（已修，2026-09-10）：`build_cstssm_qwen3vl` 此前加载完整
+   `Qwen3VLForConditionalGeneration`，但训练只用解码器与 LM 头（帧特征是离线抽好的），
+   `model.visual` 在 8 张卡上各占一份、DDP 建图时被广播一次。现在工厂在构造完
+   `Qwen3VLLanguageModel` **之后**调用 `_release_visual_tower` 删除 `model.visual`
+   （放在构造之后是因为其 `__init__` 会调 HF 的 `gradient_checkpointing_enable`，部分
+   transformers 版本内部会遍历 `visual`，先删会 `AttributeError`）。启动时会打印一行
+   `[qwen3vl] 已释放未使用的视觉塔 model.visual：N 个参数、约 XXX MB/卡`。
+   检查点侧此前已被 `trainable_only` 排除，本修复省的是**显存与 DDP 广播**。
+   需要在同一进程内在线跑视觉塔时传 `keep_visual=True` 保留（本工厂不支持该路径）。
+   回归测试：`tests/regression_release_visual.py`。
 
-6. **视觉塔白占显存**（承上条）：与检查点无关的那一半仍未解决——`model.visual` 在 8 张卡
-   上各占一份显存。真要拆需要动 `from_pretrained` 的加载路径与 `state_dict` 键名。
+   ⚠ **副作用：`state_dict` 少了全部 `visual.*` 键**，故 [§2 热启自检](#2-热启自检必看)
+   日志里的**总张量数（分母）会下降**（旧基线 1305 不再适用）。健康判据不变——
+   「命中 ≈81、形状不匹配只有 `projector.*`」这两条与视觉塔无关，仍照旧核对；只是
+   「多余/缺失」的绝对数会随分母变化。上真底座后按新日志重新标定一次基线即可。
+   （原 §8.6 与本条是同一问题的两半，已一并修复，不再单列。）
 
 ---
 

@@ -469,6 +469,33 @@ class Qwen3VLVisionFeatureExtractor:
 
 
 # ============================ 工厂 ============================
+def _release_visual_tower(hf) -> tuple[int, int]:
+    """加载后释放 Qwen3-VL 的视觉塔（`model.visual`），返回 (释放参数个数, 释放字节数)。
+
+    本工厂只走 feature 模式（帧特征离线抽好，见模块 docstring），前向只用
+    `_embed_tokens / _text_model / _lm_head` 三个组件，从不调用 `model.visual`。而
+    `from_pretrained` 会把整只 `Qwen3VLForConditionalGeneration`（含视觉塔）加载进来：
+    8 卡训练时视觉塔在每张卡各占一份显存、DDP 建图时又被广播一次——纯浪费。
+    （检查点侧已被 trainable_only 排除，这里省的是显存与广播，不是磁盘。）
+
+    抽特征用的 `Qwen3VLVisionFeatureExtractor` 是**另一条独立加载路径**（自己
+    `from_pretrained` 一份），与本函数无关，故释放这里的视觉塔不影响离线抽特征。
+
+    只删模块、不动 `hf.config.vision_config`：feat_dim 仍能从 config 读到（见工厂）。
+    """
+    base = getattr(hf, "model", hf)
+    visual = getattr(base, "visual", None)
+    if visual is None:
+        return 0, 0
+    n = sum(p.numel() for p in visual.parameters())
+    nbytes = sum(p.numel() * p.element_size() for p in visual.parameters())
+    try:
+        delattr(base, "visual")
+    except AttributeError:                       # 极少数版本 visual 是 property/slot
+        base.visual = None                        # type: ignore[attr-defined]
+    return n, nbytes
+
+
 def build_cstssm_qwen3vl(model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
                          d_model: int = 768,
                          branches=None,
@@ -478,6 +505,7 @@ def build_cstssm_qwen3vl(model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
                          lora_r: int = 16, lora_alpha: int = 32,
                          dtype=None, base_cfg=None, grad_checkpoint: bool | None = None,
                          device_map=None,
+                         keep_visual: bool = False,
                          **hf_kwargs):
     """构建"Qwen3-VL 视觉塔特征 + CST-SSM 时序 + Qwen3-VL LLM"的端到端模型。
 
@@ -505,6 +533,12 @@ def build_cstssm_qwen3vl(model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
 
         accelerate 未装或 transformers 版本不认这个 kwarg 时自动退回 CPU 加载路径
         （只影响峰值内存与启动耗时，不影响正确性）。
+
+    keep_visual: 默认 False = 加载后立即释放视觉塔（`model.visual`），省掉 8 卡各一份
+        显存与 DDP 建图广播（本工厂只走 feature 模式，前向从不调用它，见
+        `_release_visual_tower`）。仅当你要在同一进程内用这只底座在线跑像素/视觉塔
+        （本工厂不支持的路径）时才设 True。释放会减少 `state_dict` 的 `visual.*` 键，
+        热启日志的总张量数（run.md §2 的分母）随之下降——这是预期的。
     """
     from dataclasses import replace
     from ..ops.spectral_init import DEFAULT_BRANCHES
@@ -555,6 +589,18 @@ def build_cstssm_qwen3vl(model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
     qwen_llm = Qwen3VLLanguageModel(hf, train_base=not lora, grad_checkpoint=_gc,
                                     loss_chunk=_lc)
     model = CSTSSMModel(cfg, llm=qwen_llm)               # 视觉走特征缓存，故不注入 vision
+
+    # 特征是离线抽好的，本工厂的前向从不调用视觉塔：释放 model.visual，省掉 8 卡各
+    # 一份显存 + DDP 建图广播（见 _release_visual_tower）。释放刻意放在 Qwen3VLLanguageModel
+    # 构造**之后**：其 __init__ 会调 HF 的 gradient_checkpointing_enable，部分 transformers
+    # 版本内部会遍历 model.visual，先删会触发 AttributeError。feat_dim 取自
+    # hf.config.vision_config（config 不受影响），已在上方读取完毕。
+    if not keep_visual:
+        n_rel, b_rel = _release_visual_tower(hf)
+        if n_rel:
+            print(f"[qwen3vl] 已释放未使用的视觉塔 model.visual：{n_rel} 个参数、"
+                  f"约 {b_rel / 1024 ** 2:.0f}MB/卡（feature 模式前向不需要它；"
+                  f"如需在线跑视觉塔请传 keep_visual=True）")
 
     if lora:
         # 只给 Qwen3 解码器挂 LoRA；CST-SSM 时序/投影小参数默认可训
