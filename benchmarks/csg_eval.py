@@ -1,22 +1,9 @@
 #!/usr/bin/env python3
-"""
-benchmarks/csg_eval.py  —  CSG 评测：亚帧 MAE / R@IoU / Floor-Break Rate
+"""CSG eval: sub-frame MAE, recall at IoU, and floor-break rate.
 
-指标：
-  - 亚帧 MAE：边界端点绝对误差均值(秒)，越小越好。
-  - R@0.7 / R@0.9：时序 IoU≥阈值的召回。
-  - Floor-Break Rate：边界 MAE < δ/4 的样本占比。离散模型≈0；连续模型应显著>0。
-  - grid-snapped MAE：把预测吸附到输入网格后的 MAE——即"离散模型能达到的最好水平"，
-        用于在同一张图上画出 δ/4 地板，直观展示连续范式穿透地板。
-
-预测格式（jsonl）：{"query_id","pred_start","pred_end"}
-用法：
-  # 真实：用你的模型对 csg_*.jsonl 出预测后
-  python csg_eval.py --manifest csg_delta2.jsonl --pred my_preds.jsonl
-  # 只跑通逻辑（合成"连续/离散"两种预测对比）：
-  python csg_eval.py --manifest csg_demo.jsonl --demo
-  # 把任意预测按离散模型模拟（吸附到网格），看它如何撞地板：
-  python csg_eval.py --manifest csg_demo.jsonl --pred my_preds.jsonl --snap-to-grid
+Usage:
+    python csg_eval.py --manifest csg_delta2.jsonl --pred my_preds.jsonl
+    python csg_eval.py --manifest csg_demo.jsonl --demo
 """
 from __future__ import annotations
 import argparse, random
@@ -36,7 +23,7 @@ def evaluate(manifest: list[dict], preds: dict[str, tuple[float, float]],
             n_missing += 1
             continue
         pred = preds[seg.query_id]
-        if snap:                      # 模拟离散模型：只能输出网格上的时刻
+        if snap:
             pred = snap_segment(pred, seg.input_grid)
         gt = (seg.gt_start, seg.gt_end)
         iou = temporal_iou(pred, gt)
@@ -47,17 +34,15 @@ def evaluate(manifest: list[dict], preds: dict[str, tuple[float, float]],
         per_delta[row.get("delta", "NA")]["mae"].append(mae)
         per_delta[row.get("delta", "NA")]["break"].append(1.0 if mae < floor else 0.0)
 
-    mae_eval = mean(maes)             # 分子分母同一批 evaluated 行，避免漏答操纵指标
+    mae_eval = mean(maes)
     floor_eval = mean(floors)
     res = {
         "n_eval": len(maes), "n_missing": n_missing,
         "sub_frame_MAE": mae_eval,
-        "mean_floor(δ/4)": floor_eval,
-        # 头号判据：MAE/floor < 1 ⇒ 穿透离散地板（只有连续查询能做到）
+        "mean_floor(d/4)": floor_eval,
         "MAE/floor_ratio": (mae_eval / floor_eval) if floor_eval > 0 else float("nan"),
         "R@0.7": recall_at_iou(ious, 0.7),
         "R@0.9": recall_at_iou(ious, 0.9),
-        # 次判据：per-sample 低于地板的比例。理论上 离散→0.5(对称于地板)、连续→1.0
         "Floor_Break_Rate": mean(breaks),
         "per_delta": {str(k): {"MAE": round(mean(v["mae"]), 4),
                                 "FloorBreak": round(mean(v["break"]), 4)}
@@ -66,12 +51,8 @@ def evaluate(manifest: list[dict], preds: dict[str, tuple[float, float]],
     return res
 
 
-# ----------------- demo：合成两种"模型"的预测，验证地板效应 -----------------
 def demo_preds(manifest: list[dict], seed: int = 0):
-    """
-    continuous：在真值附近加小噪声(σ≈0.15s)，可穿透 δ/4。
-    discrete  ：先加同样小噪声，再吸附到输入网格 → 被 δ/4 地板卡住。
-    """
+    """Synthetic continuous vs discrete predictions showing the floor effect."""
     rng = random.Random(seed)
     cont, disc = {}, {}
     for row in manifest:
@@ -86,26 +67,20 @@ def demo_preds(manifest: list[dict], seed: int = 0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True, help="csg_build 产出的 jsonl")
-    ap.add_argument("--pred", help="预测 jsonl {query_id,pred_start,pred_end}")
-    ap.add_argument("--snap-to-grid", action="store_true",
-                    help="把预测吸附到输入网格（模拟离散模型）")
-    ap.add_argument("--demo", action="store_true",
-                    help="合成 continuous vs discrete 两组预测对比")
+    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--pred")
+    ap.add_argument("--snap-to-grid", action="store_true")
+    ap.add_argument("--demo", action="store_true")
     args = ap.parse_args()
 
     manifest = read_jsonl(args.manifest)
 
     if args.demo:
         cont, disc = demo_preds(manifest)
-        print("=== [DEMO] Continuous 模型（可穿透地板）===")
+        print("=== Continuous (breaks the floor) ===")
         _print(evaluate(manifest, cont, snap=False))
-        print("\n=== [DEMO] Discrete 模型（预测吸附到网格，撞 δ/4 地板）===")
+        print("\n=== Discrete (snapped to grid) ===")
         _print(evaluate(manifest, disc, snap=False))
-        print("\n解读（理论预测）：\n"
-              "  · 头号判据 MAE/floor_ratio：连续 ≪1（穿透地板）；离散 ≈1（触底，Prop.2）。\n"
-              "  · sub_frame_MAE：离散 ≈ δ/4（mean_floor）；连续 ≪ δ/4。\n"
-              "  · Floor_Break_Rate：离散 ≈0.5（对称于地板）；连续 →1.0。")
         return
 
     rows = read_jsonl(args.pred)
@@ -119,7 +94,7 @@ def _print(res: dict):
         if k == "per_delta":
             print("  per_delta:")
             for d, m in v.items():
-                print(f"    δ={d:>6}:  MAE={m['MAE']:.4f}s  FloorBreak={m['FloorBreak']:.3f}")
+                print(f"    d={d:>6}:  MAE={m['MAE']:.4f}s  FloorBreak={m['FloorBreak']:.3f}")
         else:
             print(f"  {k}: {round(v,4) if isinstance(v,float) else v}")
 

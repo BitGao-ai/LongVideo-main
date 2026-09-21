@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""
-benchmarks/vfr_eval.py  —  VFR-Stress 评测：性能随'帧率不均匀度(CV)'的退化斜率
+"""VFR-Stress eval: localization MAE slope against frame-rate irregularity (CV).
 
-核心产出：每个方法一条"定位 MAE vs 不均匀度 CV"曲线，用最小二乘拟合**斜率**。
-主张：CST-SSM（用真实 Δt）斜率显著更平缓；Uniform-Δ / Δt-fed Mamba 随 CV 上升明显退化。
-
-预测格式（jsonl）：{"query_id","pred_start","pred_end"}（query_id 含 @lv 后缀，见 vfr_build）
-用法：
-  python vfr_eval.py --manifest vfr.jsonl --pred cstssm.jsonl --name CST-SSM \
-                     --pred uniform.jsonl --name Uniform-Δ --pred dtfed.jsonl --name Δt-fed
-  python vfr_eval.py --manifest vfr_demo.jsonl --demo
+Usage:
+    python vfr_eval.py --manifest vfr.jsonl --pred cstssm.jsonl --name CST-SSM
+    python vfr_eval.py --manifest vfr_demo.jsonl --demo
 """
 from __future__ import annotations
 import argparse, random
@@ -18,7 +12,7 @@ from common import read_jsonl, segment_from_row, boundary_mae, mean
 
 
 def lsq_slope(xs, ys):
-    """最小二乘斜率 dY/dX。"""
+    """Least-squares slope dY/dX."""
     n = len(xs)
     if n < 2:
         return float("nan")
@@ -29,7 +23,7 @@ def lsq_slope(xs, ys):
 
 
 def eval_method(manifest, preds):
-    """按 level 聚合 MAE，返回 (level→(cv,MAE)) 与拟合斜率(MAE~CV)。"""
+    """Aggregate MAE per level; returns ((level, cv, MAE) curve, MAE~CV slope)."""
     by_level_mae = defaultdict(list)
     by_level_cv = defaultdict(list)
     for row in manifest:
@@ -46,14 +40,9 @@ def eval_method(manifest, preds):
 
 
 def demo_methods(manifest, seed=0):
-    """
-    合成三种方法：base MAE 相近，但对 CV 的敏感度不同。
-      CST-SSM   : MAE ≈ 0.3 + 0.15*CV     （几乎不随 CV 涨）
-      Δt-fed    : MAE ≈ 0.3 + 0.9 *CV
-      Uniform-Δ : MAE ≈ 0.3 + 2.2 *CV     （最敏感）
-    """
+    """Synthetic methods with matched base MAE but different CV sensitivity."""
     rng = random.Random(seed)
-    specs = {"CST-SSM": 0.15, "Δt-fed Mamba": 0.9, "Uniform-Δ Mamba": 2.2}
+    specs = {"CST-SSM": 0.15, "dt-fed Mamba": 0.9, "Uniform-d Mamba": 2.2}
     outs = {}
     for name, k in specs.items():
         preds = {}
@@ -68,7 +57,7 @@ def demo_methods(manifest, seed=0):
 
 
 def report(name, curve, slope):
-    print(f"\n=== {name} ===  斜率 dMAE/dCV = {slope:.3f}  (越小越鲁棒)")
+    print(f"\n=== {name} ===  slope dMAE/dCV = {slope:.3f} (lower is more robust)")
     print("  level    CV     MAE(s)")
     for lv, cv, m in curve:
         print(f"  {lv:>5}  {cv:5.2f}  {m:6.3f}")
@@ -77,7 +66,7 @@ def report(name, curve, slope):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
-    ap.add_argument("--pred", action="append", default=[], help="可多次；与 --name 一一对应")
+    ap.add_argument("--pred", action="append", default=[])
     ap.add_argument("--name", action="append", default=[])
     ap.add_argument("--demo", action="store_true")
     args = ap.parse_args()
@@ -90,11 +79,11 @@ def main():
         for name, preds in methods.items():
             curve, slope = eval_method(manifest, preds)
             report(name, curve, slope); slopes[name] = slope
-        print("\n斜率对比（应 CST-SSM 最小）:",
+        print("\nSlope ranking (CST-SSM should be lowest):",
               {k: round(v, 3) for k, v in sorted(slopes.items(), key=lambda x: x[1])})
         return
 
-    assert len(args.pred) == len(args.name), "--pred 与 --name 数量需一致"
+    assert len(args.pred) == len(args.name), "--pred and --name counts must match"
     for path, name in zip(args.pred, args.name):
         rows = read_jsonl(path)
         preds = {r["query_id"]: (float(r["pred_start"]), float(r["pred_end"])) for r in rows}

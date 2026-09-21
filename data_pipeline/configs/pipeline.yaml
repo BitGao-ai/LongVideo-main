@@ -1,72 +1,71 @@
-# CST-SSM 数据处理流水线统一配置
-# 被 data_pipeline/src/*.py 读取；命令行参数可覆盖对应字段。
+# Unified data-pipeline config, read by data_pipeline/src/*.py; CLI flags override fields.
 
-# ---------------- 数据根 ----------------
+# ---------------- Paths ----------------
 paths:
-  data_root: data                     # 所有相对路径的基准
+  data_root: data
   raw_videos: data/raw_videos
   filtered: data/filtered.jsonl
   rejected: data/rejected.jsonl
-  features: data/features             # .npz（小规模）
-  features_npy: data/features_npy     # .npy+.ts.npy（规模化，真 mmap）
+  features: data/features             # .npz (small scale)
+  features_npy: data/features_npy     # .npy + .ts.npy (large scale, true mmap)
   manifests: data/manifests
   stats: data/stats
 
-# ---------------- (A) 筛选 ----------------
+# ---------------- (A) Filtering ----------------
 filter:
-  min_duration_s: 60.0                # Stage-1 下限；Stage-2 用 15.0
-  max_duration_s: 10800.0             # 3h 上限，超长先切段
+  min_duration_s: 60.0                # Stage-1 floor; use 15.0 for stage-2
+  max_duration_s: 10800.0             # 3h cap; split longer videos first
   min_short_side_px: 240
-  black_frame_var_thresh: 8.0         # 帧像素方差 < 此值判黑帧/纯色
-  static_absdiff_thresh: 2.0          # 相邻采样帧平均绝对差 < 此值判静止
-  static_ratio_reject: 0.9            # 静止占比 > 此值剔除（Stage-2）
-  keep_static_ratio: 0.10             # Stage-1 刻意保留的低运动正样本比例
-  max_cuts_per_min: 40                # 场景切换密度上限（防过度剪辑）
+  black_frame_var_thresh: 8.0         # Below this pixel variance counts as black/flat
+  static_absdiff_thresh: 2.0          # Below this frame diff counts as static
+  static_ratio_reject: 0.9            # Reject above this static share (stage-2)
+  keep_static_ratio: 0.10             # Low-motion positives kept for stage-1
+  max_cuts_per_min: 40                # Scene-cut density cap
   dedup_phash_bits: 64
-  dedup_hamming_thresh: 6             # 汉明距离 < 此值判近重复
-  holdout_hashes: null                # 评测集 pHash pkl，命中即剔除（防泄漏）
+  dedup_hamming_thresh: 6             # Below this Hamming distance counts as duplicate
+  holdout_hashes: null                # Eval-set pHash pickle; hits are rejected
 
-# ---------------- (B) 采样 ----------------
+# ---------------- (B) Sampling ----------------
 sampler:
   strategy: adaptive                  # uniform | adaptive | scene
-  coarse_fps: 4.0                     # 粗扫候选帧率
-  saliency: absdiff                   # absdiff | flow（光流更准但慢）
-  theta: 0.12                         # 累积显著性触发阈值（越小越密）
-  dt_min_s: 0.2                       # 最小帧间隔（高动态段限帧率）
-  dt_max_s: 2.0                       # 最大帧间隔（静止段兜底强制采样）；定位精度地板 = δ/4
-  max_frames: 8192                    # **上限**非目标（保险丝）；须与 DataConfig.max_frames 对齐
+  coarse_fps: 4.0
+  saliency: absdiff                   # absdiff | flow (flow is slower)
+  theta: 0.12                         # Cumulative saliency trigger (smaller is denser)
+  dt_min_s: 0.2                       # Min frame gap (caps rate on dynamic segments)
+  dt_max_s: 2.0                       # Max frame gap (static-segment fallback)
+  max_frames: 8192                    # Upper bound, not a target; must match DataConfig.max_frames
 
-# ---------------- (B) 特征抽取 ----------------
+# ---------------- (B) Feature extraction ----------------
 extract:
   model: Qwen/Qwen3-VL-4B-Instruct
-  out_hidden: 3584                    # == CSTSSMConfig.feat_dim
-  patches: 9                          # 空间池化目标 P：1 / 9 / 64
+  out_hidden: 2560                    # Measured Qwen3-VL-4B visual output dim
+  patches: 9                          # Spatial pooling target P: 1 / 9 / 64
   dtype: float16
-  chunk_frames: 64                    # 视觉塔分块前向，防 OOM
-  skip_existing: true                 # 断点续跑
-  shard: null                         # "i/N" 多机分片抽取
+  chunk_frames: 64                    # Visual-tower chunk size against OOM
+  skip_existing: true                 # Resume without re-extracting
+  shard: null                         # "i/N" multi-machine sharding
 
-# ---------------- (C) manifest 构建 ----------------
+# ---------------- (C) Manifest building ----------------
 manifest:
-  placeholder_mode: single            # single（推荐，解耦）| expand（严格对齐 max_frames）
+  placeholder_mode: single            # single (recommended) | expand
   video_token: "<video>"
   default_task: qa
-  grounding_ms_precision: true        # 定位标注保留毫秒
+  grounding_ms_precision: true        # Keep millisecond precision on grounding labels
 
-# ---------------- 采样配比（重采样后写入最终 manifest）----------------
+# ---------------- Sampling ratios ----------------
 sampling:
   stage1:
     duration_bucket_weights: {"<1m": 1.0, "1-5m": 1.5, "5-15m": 2.0, "15-45m": 3.0, ">45m": 4.0}
-    density_ratio: {low: 0.3, mid: 0.5, high: 0.2}   # 事件密度三档配比
+    density_ratio: {low: 0.3, mid: 0.5, high: 0.2}
   stage2:
-    min_grounding_ratio: 0.15         # 强制注入定位增强，喂 CSG/VFR
+    min_grounding_ratio: 0.15
 
-# ---------------- (D) 校验 ----------------
+# ---------------- (D) Validation ----------------
 validate:
-  strict: true                        # 任一硬约束失败即非零退出
+  strict: true                        # Any hard failure exits nonzero
   check_monotonic_ts: true
   check_placeholder_align: true
   check_dim_consistency: true
   check_ref_reachable: true
-  warn_constant_dt: true              # Δt 退化为常数时告警（采样器可能没生效）
-  feat_dim: null                      # null=从特征自动推断（推荐）；换模型后无需手改
+  warn_constant_dt: true              # Warn when dt degrades to constant
+  feat_dim: null                      # null = infer from features (recommended)

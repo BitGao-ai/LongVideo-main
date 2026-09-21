@@ -1,4 +1,4 @@
-"""训练层：组合损失、两阶段训练器、CPIB-Distill 损失。"""
+"""Training: losses, trainer, contrastive terms."""
 from __future__ import annotations
 
 from .losses import LossWeights, finetune_loss, pretrain_loss

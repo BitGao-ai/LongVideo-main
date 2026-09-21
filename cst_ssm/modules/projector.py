@@ -1,7 +1,4 @@
-"""跨模态投影层（设计方案 §3.3）：把连续时序状态投影到 LLM 文本特征空间。
-
-两层 MLP + LayerNorm，保留时间维（连续属性）。投影后视觉状态作为 LLM 交叉注意力的键/值。
-"""
+"""Cross-modal projector: temporal states to LLM embedding space."""
 from __future__ import annotations
 
 import torch.nn as nn

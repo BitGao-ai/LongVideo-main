@@ -1,4 +1,4 @@
-"""网络模块层。"""
+"""Network modules."""
 from __future__ import annotations
 
 from .event_gate import EventGate, RunningStandardizer

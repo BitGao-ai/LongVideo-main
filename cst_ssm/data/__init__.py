@@ -1,4 +1,4 @@
-"""数据层：schema、数据集、collate、加载工厂、分词器。"""
+"""Data layer: schemas, datasets, collate, loader factory, tokenizers."""
 from __future__ import annotations
 
 from .schema import VideoSample, DataConfig

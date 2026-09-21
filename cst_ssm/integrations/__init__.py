@@ -1,4 +1,4 @@
-"""外部模型集成。"""
+"""External model integrations."""
 from __future__ import annotations
 
 from .qwen3_vl import (

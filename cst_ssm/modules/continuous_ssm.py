@@ -1,11 +1,4 @@
-"""连续 SSM 层（无事件门控）——CUDA 变步长内核的直接使用点 + 消融基线。
-
-用途：
-  1) 设计方案 §6.3 消融组 1/2 的"连续 SSM（不含事件门控）"基线；
-  2) 演示 selective_scan（GPU 上走变步长 CUDA 内核，CPU 回退纯 PyTorch）的实际调用。
-与 EACS 的区别：这里是**纯线性一阶递推**（h_k=Ā_k h_{k-1}+B̄_k u_k），无门控破坏 associativity，
-因此可整段并行扫描；事件门控稀疏更新见 modules/eacs.py。
-"""
+"""Ungated continuous SSM layer: parallel variable-step scan baseline."""
 from __future__ import annotations
 
 import torch
@@ -18,11 +11,7 @@ from ..ops.scan import selective_scan
 
 
 class ContinuousSSMLayer(nn.Module):
-    """可变 Δt 的连续对角选择性 SSM（pre-LN 残差块）。
-
-    chunk_size>0 时扫描按块做梯度检查点（数值等价）——并行扫描每层都要保留一份
-    (B,L,H,N) 复数张量，log2(L) 层加起来在 L=1024/H=384/N=64 下是 GB 量级。
-    """
+    """Variable-dt diagonal selective SSM (pre-LN residual block)."""
 
     def __init__(self, d_model: int, spec: BranchSpec, add_residual: bool = True,
                  chunk_size: int = 0):
@@ -45,26 +34,24 @@ class ContinuousSSMLayer(nn.Module):
     def forward(self, x: Tensor, timestamps: Tensor) -> Tensor:
         x_in = x
         xn = self.norm(x)
-        u = self.proj_u(xn).float()                                  # (B,L,H)
-        # autocast(bf16) 下 Linear 输出为 bf16，torch.complex 不支持 bf16，先升精度再组装复数
+        u = self.proj_u(xn).float()
         b = self.proj_B(xn).float()
-        Bc = torch.complex(b[..., :self.N], b[..., self.N:])          # complex64
+        Bc = torch.complex(b[..., :self.N], b[..., self.N:])
         c = self.proj_C(xn).float()
-        Cc = torch.complex(c[..., :self.N], c[..., self.N:])          # complex64
+        Cc = torch.complex(c[..., :self.N], c[..., self.N:])
         lam = make_lambda(self.a_log_neg_real, self.a_imag).to(torch.complex64)
 
-        # 逐步真实 Δt（首帧用次帧间隔兜底）→ 变步长离散化
         t = timestamps.float()
         dt = torch.zeros_like(t)
         dt[:, 1:] = (t[:, 1:] - t[:, :-1]).clamp_min(0)
         if t.shape[1] > 1:
             dt[:, 0] = dt[:, 1]
-        dt_eff = effective_dt(dt.unsqueeze(-1), self.log_dt_scale)   # (B,L,H)
+        dt_eff = effective_dt(dt.unsqueeze(-1), self.log_dt_scale)
 
         dA, dB = zoh_discretize(lam, dt_eff, Bc,
-                                inv_lam=torch.reciprocal(lam))       # (B,L,H,N)
-        dBu = dB * u.unsqueeze(-1)                                    # 输入注入
-        h = selective_scan(dA, dBu, chunk=self.chunk_size)           # ← 变步长扫描（CUDA/PyTorch）
-        y = torch.einsum("bln,blhn->blh", Cc, h).real + self.D * u   # 读出 + 直连
+                                inv_lam=torch.reciprocal(lam))
+        dBu = dB * u.unsqueeze(-1)
+        h = selective_scan(dA, dBu, chunk=self.chunk_size)
+        y = torch.einsum("bln,blhn->blh", Cc, h).real + self.D * u
         y = self.proj_out(y.to(x_in.dtype))
         return x_in + y if self.add_residual else y

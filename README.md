@@ -107,6 +107,10 @@ python scripts/prepare_features.py --out data_demo --n 8 --frames 40   # 生成 
 ```
 生产替换：把 `prepare_features.py` 里的随机特征换成你的视觉骨干（CLIP/SigLIP/InternVideo…）逐帧抽取的特征即可。大规模建议进一步用 WebDataset/tar 分片或 LMDB 打包 `features/`。
 
+> 单机 8 卡生产链路（吃 GPU 的是抽特征）：`torchrun --standalone --nproc_per_node=8 -m
+> data_pipeline.src.extract_features --shard auto` 并行抽（自动分片+自动绑卡），
+> 抽完必须转 `.npy`（启用真 mmap，否则 8 rank×8 worker 主机内存爆炸），详见 §4。
+
 ### 3.5 读取
 
 ```python
@@ -118,32 +122,74 @@ loader = make_loader(ds, batch_size=4)      # 变长 L/T 自动 padding + 掩码
 
 ---
 
-## 4. 快速上手
+## 4. 快速上手（单机 8 卡目标环境）
+
+> 默认按**单机 8 卡（每卡 40G）**给指令，8 卡并行利用率拉满。
+> 通用三铁律：① 各阶段用**同一份 `--config`**；② 必须显式传 `--ckpt`（否则多阶段互覆盖）；
+> ③ stage-2 / grounding 生产必须传 `--base-model`。完整说明与单卡命令见 `run.md`。
+
+### 4.0 数据准备（8 卡并行，CPU 步骤单进程即可）
 
 ```bash
-# stage-1 时序预测自监督预训练
-python scripts/train_stage1.py --device cuda --steps 2000 --ckpt checkpoints/stage1
+# 质量筛选（CPU，单进程）
+python3 -m data_pipeline.src.quality_filter \
+    --video-dir data/raw_videos --out data/filtered.jsonl --rejected data/rejected.jsonl \
+    --min-duration 60 --keep-static-ratio 0.10
 
-# stage-2 端到端任务微调（LoRA 省显存，从 stage-1 热启）
-python scripts/train_stage2.py --device cuda --steps 1000 --lora \
-       --load checkpoints/stage1/final --ckpt checkpoints/stage2
+# 抽特征（吃 GPU 的步骤，600–1200 GPU·h）：torchrun 8 进程并行，--shard auto 自动分片
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+torchrun --standalone --nproc_per_node=8 -m data_pipeline.src.extract_features \
+    --manifest data/filtered.jsonl --model weights/Qwen3-VL-4B-Instruct --device cuda \
+    --out data/features --sampler adaptive --theta 0.12 --coarse-fps 4.0 --dt-max 2.0 \
+    --max-frames 8192 --patches 9 --max-frame-tokens 256 --chunk-frames 64 \
+    --shard auto --skip-existing
 
-# 流式推理：报告有效更新率/效率
-python scripts/infer_stream.py --device cuda --frames 2000
+# .npz → .npy（规模化必做，启用真 mmap；CPU/IO 型，torchrun 只做分片加速不占 GPU）
+torchrun --standalone --nproc_per_node=8 -m data_pipeline.src.npz_to_npy \
+    --in data/features --out data/features_npy --shard-dirs --shard auto
 
-# 任意时刻连续查询 demo（杀手锏 C3）
-python scripts/infer_query.py --device cuda --frames 64 --nquery 200
+# 构建 manifest + 放行校验（单进程，秒级）
+python3 -m data_pipeline.src.build_manifest \
+    --feature-dir data/features_npy --prefer-npy --data-root data \
+    --out data/manifests/pretrain.jsonl --split train \
+    --placeholder-mode single --max-frames 8192
+python3 -m data_pipeline.src.validate_dataset \
+    --manifest data/manifests/pretrain.jsonl --data-root data \
+    --placeholder-mode single --max-frames 8192 --strict
 ```
-用配置文件：`python scripts/train_stage2.py --config configs/default.yaml`。
 
-### 4.1 训练目标（设计 §4.4）
+### 4.1 训练 / 推理（8 卡 DDP）
+
+```bash
+# stage-1 时序预测自监督预训练：8卡×batch2×grad_accum4 = 等效全局批 64
+torchrun --standalone --nproc_per_node=8 scripts/train_stage1.py --ddp \
+    --device cuda --config configs/default.yaml \
+    --manifest data/manifests/pretrain.jsonl --data-root data \
+    --ckpt checkpoints/stage1 --batch-size 2 --num-workers 8 --steps 20000
+
+# stage-2 端到端任务微调（LoRA 省显存，从 stage-1 热启；--base-model 不可省）
+torchrun --standalone --nproc_per_node=8 scripts/train_stage2.py --ddp \
+    --device cuda --config configs/default.yaml \
+    --base-model weights/Qwen3-VL-4B-Instruct --dtype bfloat16 \
+    --manifest data/manifests/lvb_train.jsonl --data-root data \
+    --ckpt checkpoints/stage2 --load checkpoints/stage1/final \
+    --batch-size 2 --num-workers 8 --steps 5000 --lora
+
+# 流式推理 / 连续查询（推理状态 O(1)，单卡即可）
+python3 scripts/infer_stream.py --device cuda --frames 2000
+python3 scripts/infer_query.py --device cuda --frames 64 --nquery 200
+```
+用配置文件：`python3 scripts/train_stage2.py --config configs/default.yaml`。
+开训首分钟核对 `[dist] world_size=8` + `[loaders] 分布式分片: world_size=8`（缺后者=8 卡算重复数据，详见 `run.md §6`）。
+
+### 4.2 训练目标（设计 §4.4）
 
 - **stage-1 自监督**（`pretrain_forward`）：未来帧特征预测 MSE **+ 掩码帧重构**（随机掩码 `mask_ratio` 帧输入，从时序上下文重构原始特征）；`pretrain_loss = λ_pred·pred + λ_recon·recon + λ_spec·谱`。
 - **stage-2 任务微调**（`forward`+`finetune_loss`）：`λ_task·L_task + λ_pred·L_pred + λ_upd·更新率 + λ_spec·谱`。
 - **退火**：门控温度 T（前期软→后期硬）与 ε（`eps_anneal_start<1` 前期多更新学动力学→后期压稀疏），由 `TrainConfig.{t_start,t_end,eps_anneal_start,eps_anneal_end}` 控制（默认 ε 不退火）。
 - **鲁棒兜底**：`CSTSSMConfig(eacs_robust_guard=True)`——连续多帧残差阶跃暴涨时临时降 ε 进高密度更新。
 
-### 4.2 消融（设计 §6.3，一套代码切开关）
+### 4.3 消融（设计 §6.3，一套代码切开关）
 
 ```python
 CSTSSMConfig(

@@ -1,9 +1,4 @@
-"""数值算子层：全架构的数值正确性心脏。
-
-- discretization : 连续时间 ZOH 离散化（可变 Δt、复数对角 SSM），设计方案 §3(P2)/§4.1
-- spectral_init  : 多尺度 HiPPO 谱初始化（时间常数 τ=-1/Re(λ)），设计方案 §4.5
-- scan           : 一阶线性递推的并行 associative scan 与序列 scan，设计方案 §3(P4)
-"""
+"""Numerical operators: ZOH discretization, spectral init, parallel scans."""
 from __future__ import annotations
 
 from .discretization import (zoh_discretize, zoh_kernels, zoh_apply_B,

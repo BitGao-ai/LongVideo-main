@@ -1,4 +1,4 @@
-"""工具层：分片检查点、LoRA、显存优化、配置、分布式。"""
+"""Utilities: sharded checkpoints, LoRA, memory, config, distributed."""
 from __future__ import annotations
 
 from .checkpoint import (save_sharded, load_sharded, verify_shards, load_checkpoint,
@@ -7,7 +7,7 @@ from .checkpoint import (save_sharded, load_sharded, verify_shards, load_checkpo
 from .distributed import (maybe_init_distributed, check_ddp_launch, dist_info,
                           resolve_device, launched_distributed, is_main_process,
                           get_rank, get_world_size, add_ddp_args, resolve_ddp,
-                          check_device_binding)
+                          check_device_binding, seed_everything, cleanup_distributed)
 from .lora import LoRALinear, apply_lora, apply_qlora, mark_only_lora_trainable
 from .memory import (set_eacs_chunk, set_gate_temperature, autocast_ctx,
                      build_optimizer, gate_temperature_schedule,
@@ -23,6 +23,7 @@ __all__ = [
     "maybe_init_distributed", "check_ddp_launch", "dist_info", "resolve_device",
     "launched_distributed", "is_main_process", "get_rank", "get_world_size",
     "add_ddp_args", "resolve_ddp", "check_device_binding",
+    "seed_everything", "cleanup_distributed",
     "LoRALinear", "apply_lora", "apply_qlora", "mark_only_lora_trainable",
     "set_eacs_chunk", "set_gate_temperature", "autocast_ctx",
     "build_optimizer", "gate_temperature_schedule",

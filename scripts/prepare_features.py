@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""数据准备示例：构造"特征缓存 + manifest"数据架构（设计方案 数据架构，需求 3）。
+"""Demo data preparation: feature caches plus a manifest.
 
-演示推荐的数据存放方式（真实场景把随机特征换成视觉骨干抽取的帧级特征）：
-    data_root/
-      features/{video_id}.npz     # features:[L,P,d] float16, timestamps:[L] float32
-      manifests/{split}.jsonl     # 每行一个 VideoSample（引用 feature_ref + 文本 + 可选定位标注）
-用法：
+Usage:
     python scripts/prepare_features.py --out data_demo --n 8 --frames 40
 """
 from __future__ import annotations
@@ -36,9 +32,9 @@ def main():
     rows = []
     for i in range(args.n):
         vid = f"vid{i:04d}"
-        L = args.frames + int(rng.integers(-5, 6))       # 变长
+        L = args.frames + int(rng.integers(-5, 6))
         feats = rng.standard_normal((L, args.patches, args.dim)).astype(np.float16)
-        gaps = rng.uniform(0.1, 0.5, size=L).astype(np.float32)  # 可变帧间隔
+        gaps = rng.uniform(0.1, 0.5, size=L).astype(np.float32)
         ts = np.cumsum(gaps)
         np.savez(os.path.join(feat_dir, f"{vid}.npz"), features=feats, timestamps=ts)
         dur = float(ts[-1])
@@ -55,9 +51,8 @@ def main():
     with open(man_path, "w") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"[prepare] 写入 {args.n} 个 .npz → {feat_dir}")
-    print(f"[prepare] 写入 manifest {len(rows)} 行 → {man_path}")
-    print(f"[prepare] 用法: VideoTemporalDataset(DataConfig(manifest='{man_path}'), data_root='{args.out}')")
+    print(f"[prepare] {args.n} .npz -> {feat_dir}")
+    print(f"[prepare] manifest {len(rows)} rows -> {man_path}")
 
 
 if __name__ == "__main__":

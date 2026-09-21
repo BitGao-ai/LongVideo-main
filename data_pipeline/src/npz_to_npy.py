@@ -1,17 +1,12 @@
-""".npz → .npy + .ts.npy 存储格式转换（规模化必做，docs/03 §3）。
-
-原因：.npz 是 zip 归档，np.load 的 mmap 对其无效 → 每次读整载解压该视频全部特征。
-分离成 {vid}.npy(features) + {vid}.ts.npy(timestamps) 后，dataset 可用 mmap_mode='r'
-真惰性按 subsample 索引只读需要的帧，长视频训练 IO/内存友好。
-
-可选两级散列目录（features_npy/{vid[:2]}/{vid}.npy）避免单目录几十万文件。
-"""
+"""Convert .npz archives to .npy + .ts.npy for true memory mapping."""
 from __future__ import annotations
 
 import argparse
 import os
 
 import numpy as np
+
+from .dist_utils import get_dist_info, log_prefix, resolve_shard, shard_list
 
 
 def convert_one(npz_path: str, out_dir: str, shard_dirs: bool) -> tuple:
@@ -20,12 +15,12 @@ def convert_one(npz_path: str, out_dir: str, shard_dirs: bool) -> tuple:
     os.makedirs(sub, exist_ok=True)
     z = np.load(npz_path)
     try:
-        feats = np.ascontiguousarray(z["features"])          # [L,P,d]
+        feats = np.ascontiguousarray(z["features"])
         ts = np.ascontiguousarray(z["timestamps"]).astype(np.float32)
     finally:
         z.close()
     npy = os.path.join(sub, f"{vid}.npy")
-    np.save(npy, feats)                                      # 连续存储 → 真 mmap
+    np.save(npy, feats)
     np.save(os.path.join(sub, f"{vid}.ts.npy"), ts)
     return vid, feats.shape, feats.dtype
 
@@ -35,9 +30,12 @@ def run(args):
     for root, _, fns in os.walk(args.inp):
         files += [os.path.join(root, f) for f in fns if f.endswith(".npz")]
     files.sort()
-    if args.shard:
-        i, n = map(int, args.shard.split("/"))
-        files = files[i::n]
+    si, sn, shard_desc, shard_src = resolve_shard(args.shard)
+    n_all = len(files)
+    files = shard_list(files, si, sn)
+    if shard_desc is not None:
+        print(f"{log_prefix()}[npz->npy] shard {shard_desc} (source={shard_src}): "
+              f"this rank handles {len(files)}/{n_all} files")
 
     total_bytes = 0
     for k, p in enumerate(files):
@@ -46,23 +44,20 @@ def run(args):
         if args.delete_src:
             os.remove(p)
         if (k + 1) % 500 == 0:
-            print(f"[npz→npy] {k+1}/{len(files)}  最近 {vid} shape={shape}")
+            print(f"[npz->npy] {k+1}/{len(files)} latest {vid} shape={shape}")
     gb = total_bytes / 1e9
-    print(f"[npz→npy] 完成 {len(files)} 个 → {args.out}  （特征体量≈{gb:.1f} GB, {dtype_note()})")
-    print(f"[npz→npy] manifest 里 feature_ref 记得指向 .npy（build_manifest --prefer-npy）")
-
-
-def dtype_note() -> str:
-    return "建议 float16 存储、索引后转 float32"
+    print(f"{log_prefix()}[npz->npy] done {len(files)} files -> {args.out} (~{gb:.1f} GB)")
+    if get_dist_info()[1] <= 1:
+        print("[npz->npy] point feature_ref at .npy in the manifest (build_manifest --prefer-npy)")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=".npz → .npy+.ts.npy（启用真 mmap）")
-    ap.add_argument("--in", dest="inp", required=True, help=".npz 特征目录")
-    ap.add_argument("--out", required=True, help="输出 .npy 目录")
-    ap.add_argument("--shard-dirs", action="store_true", help="两级散列目录（大规模）")
-    ap.add_argument("--delete-src", action="store_true", help="转换后删除源 .npz")
-    ap.add_argument("--shard", default=None, help='多机分片 "i/N"')
+    ap = argparse.ArgumentParser(description=".npz to .npy + .ts.npy (enables true mmap)")
+    ap.add_argument("--in", dest="inp", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--shard-dirs", action="store_true")
+    ap.add_argument("--delete-src", action="store_true")
+    ap.add_argument("--shard", default=None)
     run(ap.parse_args())
 
 

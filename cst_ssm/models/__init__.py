@@ -1,4 +1,4 @@
-"""端到端顶层模型。"""
+"""Top-level end-to-end model."""
 from __future__ import annotations
 
 from .cst_ssm_model import (CSTSSMModel, CSTSSMConfig, build_model,

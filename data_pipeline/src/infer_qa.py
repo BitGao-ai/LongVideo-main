@@ -1,17 +1,4 @@
-"""四基准 QA 推理：读 convert_benchmarks 的 manifest + 特征 → pred.jsonl（闭合 convert→infer→qa_eval）。
-
-打分：**逐选项似然**——对每个候选字母 L(A/B/..)，把 (prompt, L) 喂模型（视觉状态经 EACS 压缩后由
-LLM 交叉注意力条件化），取答案位的 -loss 作分数，argmax 选项即预测。等价于多选题的 loglikelihood
-判据（lmms-eval 惯例），确定性、无需生成解码。
-
-诚实边界：默认构建**未训练** CST-SSM（LLM stand-in），pred 无语义、仅验证链路/格式；真实数值
-需 --ckpt 注入训练权重。打分/选择逻辑（score_options/pick_option）与模型解耦，可单测。
-
-用法：
-  python -m data_pipeline.src.infer_qa --manifest videomme.jsonl --data-root data \
-      --ckpt ckpt_final.pt --out cstssm_videomme.jsonl
-  # 评测：python -m data_pipeline.src.qa_eval --manifest videomme.jsonl --pred cstssm_videomme.jsonl
-"""
+"""Benchmark QA inference: per-option likelihood scoring to pred.jsonl."""
 from __future__ import annotations
 
 import argparse
@@ -21,14 +8,25 @@ import string
 
 import numpy as np
 
+from .dist_utils import (
+    get_dist_info,
+    log_prefix,
+    map_device_for_rank,
+    mark_done,
+    maybe_set_cuda_device,
+    merge_jsonl_parts,
+    part_path,
+    resolve_shard,
+    shard_list,
+    wait_for_parts,
+)
 from .validate_dataset import _load_feat_ts
 
 LETTERS = string.ascii_uppercase
 
 
-# ------------------------------ 纯函数（可单测）------------------------------
 def pick_option(scores) -> tuple:
-    """分数列表 → (index, letter)，argmax（并列取首）。"""
+    """Score list to (index, letter) by argmax."""
     if not len(scores):
         return -1, ""
     idx = int(np.argmax(np.asarray(scores, dtype=np.float64)))
@@ -36,7 +34,7 @@ def pick_option(scores) -> tuple:
 
 
 def build_example(tok, prompt: str, answer: str, max_len: int):
-    """拼 (prompt, answer)，labels 对 prompt 段打 -100；**超长截 prompt 头以保住 answer 被打分**。"""
+    """Concatenate prompt and answer with -100 labels on the prompt; truncate head first."""
     p = [tok.BOS] + list(prompt.encode("utf-8"))
     a = list(answer.encode("utf-8")) + [tok.EOS]
     if len(p) + len(a) > max_len:
@@ -46,11 +44,10 @@ def build_example(tok, prompt: str, answer: str, max_len: int):
     return ids, labels
 
 
-# ------------------------------ 模型打分 ------------------------------
 def _make_batch(feats, ts, ids, labels, device="cpu"):
     import torch
-    f = torch.from_numpy(np.ascontiguousarray(feats)).float().unsqueeze(0).to(device)  # (1,L,P,d)
-    t = torch.from_numpy(np.ascontiguousarray(ts)).float().unsqueeze(0).to(device)      # (1,L)
+    f = torch.from_numpy(np.ascontiguousarray(feats)).float().unsqueeze(0).to(device)
+    t = torch.from_numpy(np.ascontiguousarray(ts)).float().unsqueeze(0).to(device)
     L = f.shape[1]
     return dict(
         features=f, timestamps=t,
@@ -63,19 +60,14 @@ def _make_batch(feats, ts, ids, labels, device="cpu"):
 
 def score_options(model, tok, feats, ts, prompt: str, options, max_len: int = 1024,
                   score_mode: str = "letter", device: str = "cpu"):
-    """对每个选项算似然分数（-loss，越大越可能）。score_mode: letter=打分字母 / text=打分选项原文。
-
-    视觉侧与候选选项无关：若 model 支持 encode_visual（CSTSSMModel），只跑**一次** O(L)
-    的视觉+时序扫描，之后只对 LLM 循环选项；否则回退成逐选项整体前向（兼容注入的 stub）。
-    4–5 个选项 × 四个基准下，这是 4–5 倍的重复扫描。
-    """
+    """Per-option likelihood scores (-loss); visual states are computed once when possible."""
     import torch
     n = len(options)
     answers = [LETTERS[i] if score_mode == "letter" else str(options[i]) for i in range(n)]
     examples = [build_example(tok, prompt, a, max_len) for a in answers]
 
     fast = hasattr(model, "encode_visual") and hasattr(model, "llm")
-    if not fast:                                        # 通用回退：逐选项整体前向
+    if not fast:
         scores = []
         for ids, labels in examples:
             batch = _make_batch(feats, ts, ids, labels, device)
@@ -85,7 +77,6 @@ def score_options(model, tok, feats, ts, prompt: str, options, max_len: int = 10
             scores.append(-float(loss))
         return scores
 
-    # 快路：视觉只算一次
     probe = _make_batch(feats, ts, examples[0][0], examples[0][1], device)
     with torch.no_grad():
         visual_states, _ = model.encode_visual(probe)
@@ -106,7 +97,7 @@ def build_default_model(feat_dim: int, d_model: int, ckpt: str | None, device: s
     import torch
     from cst_ssm.models import CSTSSMModel, CSTSSMConfig
     from cst_ssm.modules.llm_interface import LLMConfig
-    if config:                                          # 训练同款 config → 架构对齐才能正确加载 --ckpt
+    if config:
         from cst_ssm.utils import model_config_from_dict, load_yaml
         cfg = model_config_from_dict(load_yaml(config)["model"])
     else:
@@ -119,14 +110,13 @@ def build_default_model(feat_dim: int, d_model: int, ckpt: str | None, device: s
     return model
 
 
-# ------------------------------ 批推理（可注入 model/tok 便于测试）------------------------------
 def infer_manifest(rows, model, tok, data_root: str, max_len: int = 1024,
                    score_mode: str = "letter", device: str = "cpu"):
     out, fails = [], []
     for r in rows:
         try:
             options = r.get("options", [])
-            if not options:                             # 无选项（开放式）→ 跳过似然打分
+            if not options:
                 continue
             feats, ts = _load_feat_ts(r["feature_ref"], data_root)
             feats = np.asarray(feats, dtype=np.float32)
@@ -140,8 +130,15 @@ def infer_manifest(rows, model, tok, data_root: str, max_len: int = 1024,
 
 
 def run(args):
-    rows = [json.loads(l) for l in open(args.manifest, encoding="utf-8") if l.strip()]
-    # 从首个可读特征推 feat_dim
+    rows_all = [json.loads(l) for l in open(args.manifest, encoding="utf-8") if l.strip()]
+    rank, world, local_rank = get_dist_info()
+    si, sn, shard_desc, shard_src = resolve_shard(args.shard)
+    rows = shard_list(rows_all, si, sn)
+    device = map_device_for_rank(args.device, local_rank)
+    maybe_set_cuda_device(local_rank)
+    if shard_desc is not None:
+        print(f"{log_prefix()}[infer_qa] shard {shard_desc} (source={shard_src}): "
+              f"this rank handles {len(rows)}/{len(rows_all)} rows; device={device}", flush=True)
     feat_dim = args.feat_dim
     if feat_dim is None:
         for r in rows:
@@ -152,36 +149,48 @@ def run(args):
                 continue
     from cst_ssm.data.dataset import ByteTokenizer
     tok = ByteTokenizer()
-    model = build_default_model(feat_dim or 3584, args.d_model, args.ckpt, args.device, args.config)
+    model = build_default_model(feat_dim or 3584, args.d_model, args.ckpt, device, args.config)
     preds, fails = infer_manifest(rows, model, tok, args.data_root, args.max_len,
-                                  args.score_mode, args.device)
+                                  args.score_mode, device)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as f:
+    out_path = part_path(args.out, si, sn) if world > 1 else args.out
+    fail_path = out_path + ".failed"
+    with open(out_path, "w", encoding="utf-8") as f:
         for p in preds:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
     if fails:
-        with open(args.out + ".failed", "w", encoding="utf-8") as f:
+        with open(fail_path, "w", encoding="utf-8") as f:
             for x in fails:
                 f.write(json.dumps(x, ensure_ascii=False) + "\n")
-    print(f"[infer_qa] 出预测 {len(preds)} 条 → {args.out}{'；失败 %d' % len(fails) if fails else ''}")
+    print(f"{log_prefix()}[infer_qa] {len(preds)} predictions -> {out_path}"
+          f"{' (%d failed)' % len(fails) if fails else ''}")
+    if world > 1:
+        mark_done(out_path)
+        if rank == 0:
+            if wait_for_parts(args.out, world):
+                n = merge_jsonl_parts(args.out, world)
+                print(f"[infer_qa] rank0 merged {world} parts -> {args.out} ({n} rows)")
+            else:
+                print(f"[infer_qa] timed out waiting for parts of {args.out}")
+        return
     if not args.ckpt:
-        print("[infer_qa] ⚠ 未加载权重：CST-SSM 为未训练 stand-in，pred 无语义（仅验链路/格式）。"
-              "\n[infer_qa]   真实评测请 --ckpt；打分/选择逻辑本身见 score_options/pick_option。")
-    print(f"[infer_qa] 评测：python -m data_pipeline.src.qa_eval --manifest {args.manifest} --pred {args.out}")
+        print("[infer_qa] no --ckpt: untrained stand-in, predictions carry no signal.")
+    print(f"[infer_qa] eval: python -m data_pipeline.src.qa_eval --manifest {args.manifest} --pred {args.out}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="四基准 QA 逐选项似然推理 → pred.jsonl")
-    ap.add_argument("--manifest", required=True, help="convert_benchmarks 产出的 jsonl")
-    ap.add_argument("--data-root", default="data", help="feature_ref 的根")
+    ap = argparse.ArgumentParser(description="Benchmark QA per-option likelihood inference")
+    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--data-root", default="data")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--ckpt", default=None, help="训练权重（文件或分片目录）；缺省用未训练 stand-in（仅跑通链路）")
-    ap.add_argument("--config", default=None, help="训练同款 config（对齐架构以正确加载 --ckpt）")
+    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--config", default=None)
     ap.add_argument("--score-mode", default="letter", choices=["letter", "text"])
-    ap.add_argument("--feat-dim", type=int, default=None, help="缺省从特征推断")
+    ap.add_argument("--feat-dim", type=int, default=None)
     ap.add_argument("--d-model", type=int, default=96)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--shard", default=None)
     run(ap.parse_args())
 
 

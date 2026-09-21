@@ -1,19 +1,4 @@
-"""四基准 → 统一 QA manifest（对齐 VideoSample + 评测所需字段）。评测集，独立于训练。
-
-真实 per-benchmark 适配器（字段名/答案编码各不同，按官方标注归一）：
-  - VideoMME  : 每问一行，`duration` 是**档位字符串**(short/medium/long) 而非秒 → 存 duration_bucket
-                （GATE-4 需按 long 子集报告）；答案为字母 A–D；options 形如 "A. xxx"。
-  - MLVU      : `video` 文件名；`candidates` 选项；答案字母或选项原文；`question_type` 任务类。
-  - LVBench   : 超长视频；`question`(可能含选项)/`options`/`answer`/`question_type`。
-  - EgoSchema : `q_uid` 既是问题也是视频键；5 选 1；答案为**0基索引**(fullset 可能无答案→-1)。
-
-归一 schema（每行）：
-  {video_id, query_id, feature_ref, prompt:"<video> Q\nA. ..\nB. ..",
-   answer:"B"(字母), answer_index:1(0基), options:[原文...], task_type, [duration_bucket], bench, split}
-
-注：本脚本只产文本侧 manifest；评测视频同样需先经 extract_features 抽特征（feature_ref 指向）。
-    非 json/jsonl（如 parquet）请先转成 jsonl。
-"""
+"""Convert benchmark annotations to a unified QA manifest format."""
 from __future__ import annotations
 
 import argparse
@@ -23,10 +8,9 @@ import re
 import string
 
 LETTERS = string.ascii_uppercase
-_OPT_PREFIX = re.compile(r"^\(?([A-Z])[.)]\s+", re.I)      # "A. " / "A) " / "(A) "
+_OPT_PREFIX = re.compile(r"^\(?([A-Z])[.)]\s+", re.I)
 
 
-# 每基准：字段候选（按序取首个命中）+ 整数答案基（0/1）
 ADAPTERS = {
     "videomme": dict(vid=["videoID", "video_id", "video"], q=["question"],
                      opts=["options", "candidates"], ans=["answer"],
@@ -44,7 +28,6 @@ ADAPTERS = {
     "egoschema": dict(vid=["q_uid", "video_id", "video"], q=["question"],
                       opts=["option", "options"], ans=["answer", "correct_answer"],
                       task=["task_type"], bucket=[], base=0, qid=["q_uid"]),
-    # LongVideoBench：correct_choice 是 0 基索引；duration_group∈{15,60,600,3600}(秒档)；id 为问题唯一键
     "longvideobench": dict(vid=["video_id", "video_path", "video"],
                            q=["question", "question_wo_referring_query"],
                            opts=["candidates", "options"], ans=["correct_choice", "answer"],
@@ -74,9 +57,9 @@ def _iter_records(src: str):
 
 
 def extract_options(rec: dict, opt_keys) -> list:
-    """抽取选项原文列表（去掉已有的 'A. ' 前缀）。兼容 list/dict/option_0..N 分散字段。"""
+    """Extract option texts, stripping existing letter prefixes."""
     raw = _first(rec, opt_keys)
-    if raw is None:                                    # 尝试分散字段 option_0.. / a,b,c,d
+    if raw is None:
         seq = []
         for i in range(8):
             v = rec.get(f"option_{i}", rec.get(f"option{i}"))
@@ -90,44 +73,36 @@ def extract_options(rec: dict, opt_keys) -> list:
         raw = seq or None
     if raw is None:
         return []
-    if isinstance(raw, dict):                          # {"A":..,"B":..}
+    if isinstance(raw, dict):
         raw = [raw[k] for k in sorted(raw)]
     if not isinstance(raw, list):
         raw = [raw]
     out = []
     for o in raw:
         s = str(o).strip()
-        out.append(_OPT_PREFIX.sub("", s).strip())     # 去 "A. "/"A) "/"(A) " 前缀，保留原文
+        out.append(_OPT_PREFIX.sub("", s).strip())
     return out
 
 
 def normalize_answer(raw, options: list, base: int = 1):
-    """把答案归一为 (letter, index0)。支持：字母 / 整数索引(base 0或1) / 选项原文匹配。
-
-    返回 ("", -1) 表示未知（如 EgoSchema fullset 无答案）。
-    """
+    """Normalize an answer to (letter, 0-based index); ("", -1) means unknown."""
     n = len(options)
     if raw is None or raw == "":
         return "", -1
     s = str(raw).strip()
-    # 1) 单字母 —— 仅当落在选项范围内才当字母（否则可能是单字符选项原文，如 MLVU 答案"q"）
     if len(s) == 1 and s.upper() in LETTERS:
         idx = LETTERS.index(s.upper())
         if n == 0 or idx < n:
             return LETTERS[idx], idx
-        # 超出选项范围 → 落到下方原文匹配
-    # 2) 纯整数索引
     if s.lstrip("-").isdigit():
         v = int(s)
         idx = v - base if base else v
         if 0 <= idx < max(n, 1):
             return LETTERS[idx], idx
-        # base 猜错兜底
         alt = v - (1 - base)
         if 0 <= alt < max(n, 1):
             return LETTERS[alt], alt
         return "", -1
-    # 3) 选项原文匹配
     for i, o in enumerate(options):
         if s.lower() == str(o).strip().lower():
             return LETTERS[i], i
@@ -168,7 +143,6 @@ def convert_record(rec: dict, bench: str, idx: int, feature_subdir: str,
     bucket = _first(rec, ad["bucket"]) if ad["bucket"] else None
     if bucket is not None:
         row["duration_bucket"] = str(bucket).lower()
-    # 透传视频路径（若源标注带 video_path，供 extract_features 直接定位视频，无需另建映射）
     vpath = _first(rec, ["video_path", "videoPath"])
     if vpath is not None:
         row["video_path"] = str(vpath)
@@ -197,31 +171,22 @@ def run(args):
             tasks[row["task_type"]] += 1
             if "duration_bucket" in row:
                 buckets[row["duration_bucket"]] += 1
-    print(f"[convert:{args.bench}] 写入 {n} 行 → {args.out}（跳过无vid {n_skip}；无答案 {n_noans}）")
+    print(f"[convert:{args.bench}] wrote {n} rows -> {args.out} "
+          f"(skipped {n_skip} without video id; {n_noans} without answer)")
     if buckets:
-        print(f"[convert:{args.bench}] duration 分档: {dict(buckets)}（VideoMME long 子集用于 GATE-4）")
-    print(f"[convert:{args.bench}] 任务类分布(前5): {dict(tasks.most_common(5))}")
-    print(f"[convert:{args.bench}] 下一步：extract_features 抽特征 + qa_eval 评准确率")
+        print(f"[convert:{args.bench}] duration buckets: {dict(buckets)}")
+    print(f"[convert:{args.bench}] top tasks: {dict(tasks.most_common(5))}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="四基准 → 统一 QA manifest（真实适配器）")
+    ap = argparse.ArgumentParser(description="Benchmark annotations to unified QA manifest")
     ap.add_argument("--bench", required=True, choices=list(ADAPTERS))
-    ap.add_argument("--src", required=True, help="官方标注 json/jsonl（parquet 先转 jsonl）")
+    ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--feature-subdir", default="features_npy", help="feature_ref 前缀")
-    ap.add_argument("--feature-ext", default=".npy", choices=[".npy", ".npz"],
-                    help="feature_ref 的扩展名。默认 .npy —— 对应"
-                         "extract_features → npz_to_npy 之后的规模化流水线（真 mmap）。"
-                         "若**跳过** npz_to_npy、直接用 extract_features 的 .npz 产物，"
-                         "必须显式传 --feature-ext .npz，否则每一行都指向不存在的文件")
+    ap.add_argument("--feature-subdir", default="features_npy")
+    ap.add_argument("--feature-ext", default=".npy", choices=[".npy", ".npz"])
     a = ap.parse_args()
-    print(f"[convert:{a.bench}] feature_ref 形如 {a.feature_subdir}/<video_id>{a.feature_ext}")
-    if a.feature_ext == ".npy":
-        print(f"[convert:{a.bench}] 提示：.npy 需要先跑 npz_to_npy.py 转换；"
-              f"若你只有 extract_features 直出的 .npz，请加 --feature-ext .npz")
-    print(f"[convert:{a.bench}] 放行前务必跑 validate_dataset --strict 核对 feature_ref 可达性——"
-          f"不可达时 VideoTemporalDataset 会替换/占位样本，评测仍会照常报出一个准确率")
+    print(f"[convert:{a.bench}] feature_ref looks like {a.feature_subdir}/<video_id>{a.feature_ext}")
     run(a)
 
 
