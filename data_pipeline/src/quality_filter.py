@@ -8,6 +8,8 @@ from typing import Optional
 
 import numpy as np
 
+from .dist_utils import feature_stem
+
 
 def phash_from_grays(grays: np.ndarray, hash_side: int = 8) -> int:
     """Average-hash over mean gray frame; grays (k,H,W) in [0,1]."""
@@ -88,7 +90,7 @@ def run(args, cfg: dict):
     kept, rejected, seen_hashes = [], [], []
     n_static_kept = 0
     for path in videos:
-        vid = os.path.splitext(os.path.basename(path))[0]
+        vid = feature_stem(os.path.relpath(path, args.video_dir))
         try:
             grays, meta = _probe(path)
         except Exception as e:

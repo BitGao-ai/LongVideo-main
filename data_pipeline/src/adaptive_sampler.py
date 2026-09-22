@@ -9,6 +9,15 @@ from typing import Optional
 import numpy as np
 
 
+_WARNED: set = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    if key not in _WARNED:
+        _WARNED.add(key)
+        print(msg, flush=True)
+
+
 @dataclass
 class SamplerConfig:
     strategy: str = "adaptive"
@@ -148,9 +157,16 @@ def sample_video(path: str, cfg: SamplerConfig):
     grays = get_gray_batch(cand) if len(cand) else np.empty((0, 64, 64), np.float32)
     times = (cand / fps).astype(np.float32)
 
+    if cfg.saliency != "absdiff":
+        _warn_once("saliency:" + str(cfg.saliency),
+                   f"[sampler] saliency='{cfg.saliency}' is not implemented; using 'absdiff'.")
     if cfg.strategy == "uniform":
         sel_local, ts, n_raw = uniform_indices(times, cfg.coarse_fps, cfg)
     else:
+        if cfg.strategy != "adaptive":
+            _warn_once("strategy:" + str(cfg.strategy),
+                       f"[sampler] strategy '{cfg.strategy}' is not implemented "
+                       f"(no scene-cut detection); falling back to 'adaptive'.")
         sel_local, ts, n_raw = adaptive_indices(grays, times, cfg)
 
     frame_idx = cand[sel_local]
@@ -208,7 +224,8 @@ def _dry_run(cfg: SamplerConfig):
 def main():
     ap = argparse.ArgumentParser(description="Content-adaptive variable-step sampler")
     ap.add_argument("--video", help="Single video path; omit for dry-run")
-    ap.add_argument("--strategy", default="adaptive", choices=["uniform", "adaptive", "scene"])
+    ap.add_argument("--strategy", default="adaptive", choices=["uniform", "adaptive", "scene"],
+                    help="'scene' is not implemented yet; it warns and falls back to 'adaptive'")
     ap.add_argument("--saliency-accum", default="frame_diff", choices=["frame_diff", "anchor_diff"],
                     help="Saliency accumulation: frame_diff or anchor_diff")
     ap.add_argument("--theta", type=float, default=0.12)

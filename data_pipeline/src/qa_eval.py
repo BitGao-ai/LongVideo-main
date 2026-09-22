@@ -19,12 +19,13 @@ def _read_jsonl(path: str):
 
 def evaluate(manifest: list, preds: dict) -> dict:
     """preds maps query_id to raw prediction text; returns overall and grouped accuracy."""
-    correct, total, missing = 0, 0, 0
+    correct, total, missing, noans = 0, 0, 0, 0
     by_task = defaultdict(lambda: [0, 0])
     by_bucket = defaultdict(lambda: [0, 0])
     for r in manifest:
         gold = r.get("answer_index", -1)
         if gold < 0:
+            noans += 1
             continue
         qid = r["query_id"]
         if qid not in preds:
@@ -39,9 +40,11 @@ def evaluate(manifest: list, preds: dict) -> dict:
             by_bucket[r["duration_bucket"]][1] += 1
 
     acc = correct / total if total else float("nan")
+    n_all = len(manifest)
     return {
         "bench": manifest[0].get("bench", "?") if manifest else "?",
-        "n_eval": total, "n_missing_pred": missing,
+        "n_total": n_all, "n_eval": total, "n_missing_pred": missing,
+        "n_noans": noans, "skip_rate": round(noans / n_all, 4) if n_all else 0.0,
         "accuracy": round(acc, 4),
         "by_task": {k: round(c / t, 4) for k, (c, t) in sorted(by_task.items())},
         "by_duration_bucket": {k: round(c / t, 4)
@@ -79,7 +82,11 @@ def demo_preds(manifest: list, seed: int = 0):
 
 
 def _print(res: dict):
-    print(f"  bench={res['bench']}  n_eval={res['n_eval']}  n_missing_pred={res['n_missing_pred']}")
+    print(f"  bench={res['bench']}  n_total={res['n_total']}  n_eval={res['n_eval']}  "
+          f"n_missing_pred={res['n_missing_pred']}")
+    print(f"  n_noans={res['n_noans']}  skip_rate={res['skip_rate']} "
+          f"(n_noans and n_missing_pred={res['n_missing_pred']} are both excluded "
+          f"from the denominator and inflate accuracy)")
     print(f"  accuracy: {res['accuracy']}")
     if res["by_duration_bucket"]:
         print(f"  by_duration_bucket: {res['by_duration_bucket']}")

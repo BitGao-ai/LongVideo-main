@@ -32,15 +32,33 @@ def build_prompt(question: str, n_frames: int, mode: str, max_frames: int) -> st
     return (VIDEO_TOKEN * k) + " " + q
 
 
-def build_answer(row: dict, task: str) -> str:
+def build_answer(row: dict, task: str, ms_precision: bool = True) -> str:
     """Build answer string for task."""
     if task == "grounding" and "gt_start" in row and "gt_end" in row:
-        return f"from {float(row['gt_start']):.2f}s to {float(row['gt_end']):.2f}s"
+        prec = 3 if ms_precision else 2
+        return (f"from {float(row['gt_start']):.{prec}f}s "
+                f"to {float(row['gt_end']):.{prec}f}s")
     return row.get("answer", "")
+
+
+def _grounding_ms_precision(args) -> bool:
+    """Resolve grounding precision: CLI override, then pipeline.yaml, else ms."""
+    if getattr(args, "grounding_ms_precision", None) is not None:
+        return args.grounding_ms_precision
+    cfg_path = getattr(args, "pipeline_config", None)
+    if cfg_path and os.path.exists(cfg_path):
+        try:
+            from cst_ssm.utils import load_yaml
+            mani = load_yaml(cfg_path).get("manifest") or {}
+            return bool(mani.get("grounding_ms_precision", True))
+        except Exception:
+            pass
+    return True
 
 
 def run(args):
     feat_ext = ".npy" if args.prefer_npy else ".npz"
+    ms = _grounding_ms_precision(args)
     qa_index: dict = {}
     if args.qa:
         for l in open(args.qa):
@@ -77,13 +95,13 @@ def run(args):
                     n_frames=int(L),
                     prompt=build_prompt(r.get("question", r.get("prompt", "")),
                                         L, args.placeholder_mode, args.max_frames),
-                    answer=build_answer(r, task),
+                    answer=build_answer(r, task, ms),
                     task_type=task,
                     split=args.split,
                 )
                 for k in ("gt_start", "gt_end", "duration"):
                     if k in r:
-                        sample[k] = round(float(r[k]), 3)
+                        sample[k] = round(float(r[k]), 3 if ms else 2)
                 fout.write(json.dumps(sample, ensure_ascii=False) + "\n")
                 n_written += 1
     print(f"[manifest] wrote {n_written} rows -> {args.out} (mode={args.placeholder_mode})")
@@ -105,6 +123,10 @@ def main():
     ap.add_argument("--split", default="train")
     ap.add_argument("--prefer-npy", action="store_true", help="Prefer .npy over .npz")
     ap.add_argument("--require-qa", action="store_true", help="Skip features without QA")
+    ap.add_argument("--pipeline-config", default="data_pipeline/configs/pipeline.yaml",
+                    help="Source of manifest.grounding_ms_precision")
+    ap.add_argument("--grounding-ms-precision", action=argparse.BooleanOptionalAction,
+                    default=None, help="Override grounding label precision (ms vs 10ms)")
     run(ap.parse_args())
 
 

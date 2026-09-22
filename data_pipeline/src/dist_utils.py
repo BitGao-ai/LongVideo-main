@@ -1,8 +1,28 @@
-"""Rank sharding helpers for offline batch scripts (no torch dependency)."""
+"""Shared helpers for offline batch scripts (no torch dependency)."""
 from __future__ import annotations
 
 import os
 import time
+
+
+_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts")
+
+
+def feature_stem(name: str) -> str:
+    """Normalize a video id or relative path into a filesystem-safe feature stem.
+
+    Path separators become '_' so ids stay unique across subdirectories, and a
+    trailing video extension is stripped. Shared by quality_filter and
+    convert_benchmarks so both name features identically.
+    """
+    stem = str(name).strip().replace("\\", "_").replace("/", "_")
+    low = stem.lower()
+    for ext in _VIDEO_EXTS:
+        if low.endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    stem = stem.strip()
+    return stem or str(name).strip()
 
 
 def get_dist_info() -> tuple[int, int, int]:

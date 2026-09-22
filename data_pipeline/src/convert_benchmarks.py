@@ -7,6 +7,8 @@ import os
 import re
 import string
 
+from .dist_utils import feature_stem
+
 LETTERS = string.ascii_uppercase
 _OPT_PREFIX = re.compile(r"^\(?([A-Z])[.)]\s+", re.I)
 
@@ -123,7 +125,7 @@ def convert_record(rec: dict, bench: str, idx: int, feature_subdir: str,
     vid = _first(rec, ad["vid"])
     if vid is None:
         return None
-    vid = str(vid).strip()
+    vid = feature_stem(vid)
     options = extract_options(rec, ad["opts"])
     letter, aidx = normalize_answer(_first(rec, ad["ans"]), options, ad["base"])
     qid_raw = _first(rec, ad["qid"])

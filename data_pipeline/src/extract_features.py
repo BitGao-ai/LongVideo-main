@@ -187,7 +187,7 @@ def _save_npz(out_npz: str, feats, ts, fp: str, meta: dict):
 
 def run(args):
     scfg = SamplerConfig(strategy=args.sampler, theta=args.theta,
-                         coarse_fps=args.coarse_fps, dt_max_s=args.dt_max,
+                         coarse_fps=args.coarse_fps, dt_min_s=args.dt_min, dt_max_s=args.dt_max,
                          saliency_accum=args.saliency_accum,
                          max_frames=args.max_frames)
     os.makedirs(args.out, exist_ok=True)
@@ -242,7 +242,17 @@ def run(args):
                     meta = dict(duration=float(ts[-1]), n_sampled=L, strategy=args.sampler,
                                 event_density=round(L/float(ts[-1]), 4), model="dry-run")
                 else:
-                    video_path = r.get("video_path") or os.path.join(args.video_root, r.get("rel_path", vid + ".mp4"))
+                    video_path = r.get("video_path")
+                    if not video_path:
+                        rel = r.get("rel_path")
+                        if rel:
+                            video_path = os.path.join(args.video_root, rel)
+                        else:
+                            video_path = os.path.join(args.video_root, vid + ".mp4")
+                            if not os.path.exists(video_path):
+                                raise FileNotFoundError(
+                                    f"{vid}: manifest has no video_path/rel_path and the "
+                                    f"guessed '{video_path}' is absent; set video_path explicitly")
                     print(f"[extract] ({idx}/{len(rows)}) {vid}: sampling -> {video_path}", flush=True)
                     frame_idx, ts, meta = sample_video(video_path, scfg)
                     print(f"[extract] ({idx}/{len(rows)}) {vid}: sampled L={len(frame_idx)} "
@@ -278,10 +288,12 @@ def main():
     ap.add_argument("--out-hidden", type=int, default=None)
     ap.add_argument("--patches", type=int, default=9)
     ap.add_argument("--max-frame-tokens", type=int, default=256)
-    ap.add_argument("--sampler", default="adaptive", choices=["uniform", "adaptive", "scene"])
+    ap.add_argument("--sampler", default="adaptive", choices=["uniform", "adaptive", "scene"],
+                    help="'scene' is not implemented yet; it warns and falls back to 'adaptive'")
     ap.add_argument("--saliency-accum", default="frame_diff", choices=["frame_diff", "anchor_diff"])
     ap.add_argument("--theta", type=float, default=0.12)
     ap.add_argument("--coarse-fps", type=float, default=4.0)
+    ap.add_argument("--dt-min", type=float, default=0.2)
     ap.add_argument("--dt-max", type=float, default=2.0)
     ap.add_argument("--max-frames", type=int, default=8192)
     ap.add_argument("--chunk-frames", type=int, default=64)

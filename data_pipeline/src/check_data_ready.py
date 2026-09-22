@@ -105,7 +105,7 @@ def check_rows_deep(manifest: str, root: str, placeholder_mode: str,
     for i, r in enumerate(rows):
         ref = r.get("feature_ref")
         try:
-            base_errs, d = check_row(r, root, cfg)
+            base_errs, d, _p = check_row(r, root, cfg)
         except Exception as e:
             errs.append(f"row {i} {r.get('video_id')}: checker error {e}")
             continue

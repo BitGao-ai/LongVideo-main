@@ -19,7 +19,10 @@ def _load_feat_ts(ref: str, root: str):
         ts = np.load(ts_path)
         return feats, np.asarray(ts, np.float32)
     z = np.load(path)
-    return z["features"], np.asarray(z["timestamps"], np.float32)
+    try:
+        return z["features"], np.asarray(z["timestamps"], np.float32)
+    finally:
+        z.close()
 
 
 def count_video_tokens(prompt: str) -> int:
@@ -40,18 +43,19 @@ def _infer_feat_dim(rows: list, root: str):
     return None
 
 
-def check_row(r: dict, root: str, cfg: dict) -> tuple[list, int | None]:
-    """Return (errors, feature dim); soft warnings carry a 'WARN:' prefix."""
+def check_row(r: dict, root: str, cfg: dict) -> tuple[list, int | None, int | None]:
+    """Return (errors, feature dim, patch count P); soft warnings carry a 'WARN:' prefix."""
     errs = []
     ref = r.get("feature_ref")
     if not ref:
-        return ["missing feature_ref"], None
+        return ["missing feature_ref"], None, None
     try:
         feats, ts = _load_feat_ts(ref, root)
     except Exception as e:
-        return [f"unreachable feature_ref: {e}"], None
+        return [f"unreachable feature_ref: {e}"], None, None
 
     L = int(feats.shape[0]); d = int(feats.shape[-1])
+    p = int(feats.shape[1]) if getattr(feats, "ndim", 0) >= 3 else None
 
     if cfg["check_monotonic_ts"]:
         if len(ts) != L:
@@ -82,7 +86,7 @@ def check_row(r: dict, root: str, cfg: dict) -> tuple[list, int | None]:
         dur = float(r.get("duration", ts[-1] if len(ts) else 0))
         if float(r["gt_end"]) > dur + 1e-3 or float(r.get("gt_start", 0)) < -1e-3:
             errs.append(f"WARN: grounding span [{r.get('gt_start')},{r['gt_end']}] outside duration {dur}")
-    return errs, d
+    return errs, d, p
 
 
 def run(args, cfg: dict):
@@ -96,9 +100,9 @@ def run(args, cfg: dict):
             cfg["feat_dim"] = d
             print(f"[validate] inferred expected dim={d} from features")
     n_err = n_warn = 0
-    dims = set()
+    dims, patches = set(), set()
     for i, r in enumerate(rows):
-        errs, dim = check_row(r, args.data_root, cfg)
+        errs, dim, patch = check_row(r, args.data_root, cfg)
         for e in errs:
             if e.startswith("WARN:"):
                 n_warn += 1
@@ -109,10 +113,14 @@ def run(args, cfg: dict):
                 print(f"  [ERR ] row {i} {r.get('video_id')}: {e}")
         if dim is not None:
             dims.add(dim)
+        if patch is not None:
+            patches.add(patch)
 
     print(f"[validate] {len(rows)} rows: {n_err} errors, {n_warn} warnings")
     if len(dims) > 1:
         print(f"  [ERR ] inconsistent feat_dim across rows: {sorted(dims)}"); n_err += 1
+    if len(patches) > 1:
+        print(f"  [ERR ] inconsistent P across rows: {sorted(patches)}"); n_err += 1
     if n_err == 0:
         print("[validate] all hard checks passed")
     else:
