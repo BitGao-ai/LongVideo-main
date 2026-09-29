@@ -6,6 +6,11 @@ model:
   gate_init_eps: 0.1
   eacs_chunk: 32             # EACS chunked checkpoint size; 0 disables.
   pretrain_horizon: 1
+  # Event-committed visual tokens: "all" = one token per frame; "commit" = only
+  # frames where an observer branch committed an update reach the LLM, so the
+  # LLM input length scales with events, not video duration.
+  visual_token_mode: all     # all | commit
+  innov_branches: [0]        # observer branches driving innov loss + commit selection
   branches:                  # Short/sec, mid/min, long/hour scales.
     - {name: short, n_state: 16, tau_min: 0.1,  tau_max: 1.0,    imag_scale: 1.0}
     - {name: mid,   n_state: 32, tau_min: 10.0, tau_max: 60.0,   imag_scale: 0.3}
@@ -47,6 +52,7 @@ loss:
   pred: 0.5
   update_rate: 0.1
   spectral: 0.05
+  innov: 0.5                 # self-supervised predictive-coding (innovation) loss
 
 data:
   manifest: null

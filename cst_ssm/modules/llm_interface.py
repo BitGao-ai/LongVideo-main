@@ -48,7 +48,16 @@ def _sdpa(q: Tensor, k: Tensor, v: Tensor, scale: float,
 
 
 class GatedCrossAttention(nn.Module):
-    """Text-to-visual gated cross-attention; zero-init gate preserves base LM behavior."""
+    """Text-to-visual gated cross-attention with a small nonzero init gate.
+
+    The gate starts at 0.1 (tanh ~ 0.0997) instead of exactly 0: a zero gate
+    multiplies the visual contribution AND blocks task-loss gradients to the
+    whole visual path (EACS, projector, event-gate threshold) at step 0, which
+    dead-lends commit-mode token selection that relies on those gradients.
+    The small init still preserves base-LM behavior within ~10%.
+    """
+
+    GATE_INIT = 0.1
 
     def __init__(self, dim: int, n_heads: int):
         super().__init__()
@@ -60,6 +69,8 @@ class GatedCrossAttention(nn.Module):
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
         self.gate = nn.Parameter(torch.zeros(1))
+        with torch.no_grad():  # fill_ keeps the RNG stream unchanged
+            self.gate.fill_(self.GATE_INIT)
 
     def forward(self, text: Tensor, visual: Tensor,
                 visual_mask: Tensor | None = None) -> Tensor:

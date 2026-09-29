@@ -16,6 +16,7 @@ class LossWeights:
     update_rate: float = 0.1
     spectral: float = 0.05
     diff_kv: float = 0.05
+    innov: float = 0.5      # self-supervised predictive-coding (innovation) loss
     cpib: CPIBWeights | None = None
 
 
@@ -52,6 +53,9 @@ def finetune_loss(out: dict, w: LossWeights, model=None, step: int = 0):
     if "pred_loss" in out:
         total = total + w.pred * out["pred_loss"]
         comp["pred"] = out["pred_loss"].detach()
+    if "innov_loss" in out and w.innov > 0:
+        total = total + w.innov * out["innov_loss"]
+        comp["innov"] = out["innov_loss"].detach()
     if "update_rate" in out:
         total = total + w.update_rate * out["update_rate"]
         comp["update_rate"] = out["update_rate"].detach()
@@ -61,6 +65,8 @@ def finetune_loss(out: dict, w: LossWeights, model=None, step: int = 0):
     if "diff_kv_loss" in out and w.diff_kv > 0:
         total = total + w.diff_kv * out["diff_kv_loss"]
         comp["diff_kv"] = out["diff_kv_loss"].detach()
+    if "visual_token_ratio" in out:  # commit-mode sparsity metric (log only)
+        comp["visual_token_ratio"] = out["visual_token_ratio"]
     if model is not None:
         cpib_l, cpib_comp = _compute_cpib(out, model, w, step)
         total = total + cpib_l
@@ -76,6 +82,9 @@ def pretrain_loss(out: dict, w: LossWeights, model=None, step: int = 0):
     if "recon_loss" in out:
         total = total + w.recon * out["recon_loss"]
         comp["recon"] = out["recon_loss"].detach()
+    if "innov_loss" in out and w.innov > 0:
+        total = total + w.innov * out["innov_loss"]
+        comp["innov"] = out["innov_loss"].detach()
     if "spectral_reg" in out:
         sr = out["spectral_reg"]
         sr = sr if torch.is_tensor(sr) else torch.tensor(float(sr))

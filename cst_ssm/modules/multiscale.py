@@ -21,6 +21,7 @@ class MultiScaleOutput:
     per_branch_update_rate: Tensor   # (n_branch,)
     fusion_weights: Tensor           # (B, L, n_branch)
     residual: Tensor                 # (B, n_branch, L)
+    innovation: Tensor | None = None  # (B, n_branch, L); None if any branch ran a fused path
 
 
 class MultiScaleEACS(nn.Module):
@@ -133,18 +134,19 @@ class MultiScaleEACS(nn.Module):
 
         cs = b0.chunk_size
         if b0.training and cs and cs > 0 and L > cs:
-            ys = gs = rs = None
+            ys = gs = rs = ns = None
             for k0 in range(0, L, cs):
                 k1 = min(k0 + cs, L)
-                y_c, g_c, r_c, state = ckpt.checkpoint(
+                y_c, g_c, r_c, n_c, state = ckpt.checkpoint(
                     scan_range, p, state, u, Bc, Cc, t, k0, k1, cpi_s,
                     None, use_reentrant=False)
                 ys = _write_chunk(ys, y_c, L, k0, k1)
                 gs = _write_chunk(gs, g_c, L, k0, k1)
                 rs = _write_chunk(rs, r_c, L, k0, k1)
-                del y_c, g_c, r_c
+                ns = _write_chunk(ns, n_c, L, k0, k1)
+                del y_c, g_c, r_c, n_c
         else:
-            ys, gs, rs, _ = scan_range(p, state, u, Bc, Cc, t, 0, L, cpi=cpi_s)
+            ys, gs, rs, ns, _ = scan_range(p, state, u, Bc, Cc, t, 0, L, cpi=cpi_s)
 
         outs = []
         for i, br in enumerate(brs):
@@ -152,7 +154,8 @@ class MultiScaleEACS(nn.Module):
             g_i = gs[..., i].contiguous()
             outs.append(EACSOutput(
                 y=(x + delta if br.add_residual else delta),
-                gates=g_i, update_rate=g_i.mean(), residual=rs[..., i].contiguous()))
+                gates=g_i, update_rate=g_i.mean(), residual=rs[..., i].contiguous(),
+                innovation=ns[..., i].contiguous()))
         return outs
 
 
@@ -176,6 +179,8 @@ class MultiScaleEACS(nn.Module):
         y = self.out_norm(x + fused)
         gates = torch.stack([o.gates for o in outs], dim=1)
         res = torch.stack([o.residual for o in outs], dim=1)
+        innov = (torch.stack([o.innovation for o in outs], dim=1)
+                 if all(o.innovation is not None for o in outs) else None)
         if frame_mask is not None:
             m = frame_mask.to(gates.dtype).unsqueeze(1)
             denom = m.sum().clamp_min(1.0)
@@ -185,7 +190,8 @@ class MultiScaleEACS(nn.Module):
             update_rate = gates.mean()
             pbur = torch.stack([o.update_rate for o in outs])
         return MultiScaleOutput(y=y, gates=gates, update_rate=update_rate,
-                                per_branch_update_rate=pbur, fusion_weights=w, residual=res)
+                                per_branch_update_rate=pbur, fusion_weights=w, residual=res,
+                                innovation=innov)
 
     def spectral_reg(self) -> Tensor:
         return sum(br.spectral_reg() for br in self.branches) / self.n_branch

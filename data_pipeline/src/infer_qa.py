@@ -79,7 +79,7 @@ def score_options(model, tok, feats, ts, prompt: str, options, max_len: int = 10
 
     probe = _make_batch(feats, ts, examples[0][0], examples[0][1], device)
     with torch.no_grad():
-        visual_states, _ = model.encode_visual(probe)
+        visual_states, aux = model.encode_visual(probe)
     scores = []
     for ids, labels in examples:
         iid = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
@@ -87,7 +87,8 @@ def score_options(model, tok, feats, ts, prompt: str, options, max_len: int = 10
         with torch.no_grad():
             out = model.llm(input_ids=iid, visual_states=visual_states,
                             attention_mask=torch.ones_like(iid, dtype=torch.bool),
-                            visual_mask=probe["frame_mask"], labels=lab)
+                            visual_mask=aux.get("visual_mask", probe["frame_mask"]),
+                            labels=lab)
         scores.append(-float(out["loss"]))
     return scores
 

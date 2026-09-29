@@ -288,7 +288,7 @@ python3 -m data_pipeline.src.validate_dataset \
 
 | 脚本 | 作用 | LLM 段 | 关键显存手段 |
 |---|---|---|---|
-| `scripts/train_stage1.py` | 时序预测自监督预训练 | **不使用 LLM**（损失只有 pred/recon/spectral） | bf16 + `eacs_chunk=32` 分块梯度检查点 |
+| `scripts/train_stage1.py` | 时序预测自监督预训练 | **不使用 LLM**（损失只有 pred/recon/innov/spectral） | bf16 + `eacs_chunk=32` 分块梯度检查点 |
 | `scripts/train_stage2.py` | 端到端任务微调 | `--base-model` → Qwen3-VL；不给 → stand-in | 同上 + `--lora` + `--load` 热启 stage-1 |
 | `scripts/train_qwen3vl.py` | Qwen3-VL 底座生产入口（不吃 `--config`） | 始终 Qwen3-VL | LoRA（默认开）+ `--grad-accum` + LLM 逐层 `grad_checkpoint` |
 | `scripts/train_grounding.py` | 定位打分头 | 同 stage-2 | `--lora` + `--load` 热启 stage-2 |
@@ -302,6 +302,12 @@ python3 -m data_pipeline.src.validate_dataset \
   比 4B 底座权重还大。分块后峰值 `= loss_chunk·V×10`（约 1.5GB）且**与 T 无关**。
   详见 [§6.1 显存预算](#61-显存预算8×40g)
 - `train.grad_accum: 4`、`train.bf16`
+- `model.visual_token_mode: all|commit` — **事件提交视觉 token**（stage-2，可用 `--visual-token-mode commit` 覆盖）。
+  `commit` 时只有观察分支（`model.innov_branches`，默认 short 分支）提交了状态更新的帧才会成为
+  LLM 视觉 token（`<video>` 占位符随帧删除、文本紧凑重排），**LLM 输入长度 ∝ 事件数而非视频时长**；
+  训练日志中的 `visual_token_ratio` 即保留 token 比例。阈值 ε 由自监督 innovation 损失（`loss.innov`）
+  与任务损失（经直通估计器）共同校准。回归验证：`tests/regression_innovation_commit.py`（E1–E8）。
+  注意：`eacs_fused_train` 与融合 CUDA 推理核不返回 innovation，启用 innov 损失训练时保持 `eacs_fused_train: false`。
 - `train.ddp: false` — 单机多卡开关，`torchrun` 启动时必须为 `true`（或命令行传 `--ddp`）
 - `data.length_bucketing: true` — 长度分桶减少 padding 浪费，自带 DDP 分片逻辑
 

@@ -175,12 +175,17 @@ def load_features(feature_ref: str, data_root: str):
 def run(args):
     rows = read_jsonl(args.manifest)
     scorer = build_scorer(args)
+    frame_grid = getattr(args, "frame_grid", False)
     out, n_fail = [], 0
     fails = []
     for r in rows:
         try:
             feats, ts = load_features(r["feature_ref"], args.data_root)
-            tq = subframe_grid(ts, args.query_factor)
+            # 公平基线（设计方案 §6.3）：--frame-grid 只在输入帧时刻打分，
+            # 再用与连续查询完全相同的 boundaries_from_scores 插值提边界，
+            # 即“离散模型 + 同款插值”。
+            tq = (np.asarray(ts, dtype=np.float64) if frame_grid
+                  else subframe_grid(ts, args.query_factor))
             scores = scorer.score(feats, ts, tq, r.get("prompt", r.get("query", "")))
             ps, pe = boundaries_from_scores(tq, scores, args.rel_thresh)
             out.append({"query_id": r["query_id"], "pred_start": round(ps, 4),
@@ -192,6 +197,9 @@ def run(args):
     if fails:
         write_jsonl(args.out + ".failed", fails)
     print(f"[infer] {len(out)} predictions -> {args.out}{' (%d failed)' % n_fail if n_fail else ''}")
+    if frame_grid:
+        print("[infer] frame-grid mode: scores at input frame times + same interpolation "
+              "(discrete fair baseline, §6.3).")
     if not args.ckpt:
         print("[infer] no --ckpt: scorer is untrained, predictions carry no signal.")
 
@@ -205,6 +213,9 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--scorer", default="trained", choices=["trained", "hash"])
     ap.add_argument("--query-factor", type=int, default=8)
+    ap.add_argument("--frame-grid", action="store_true",
+                    help="score only at input frame times, then apply the same "
+                         "threshold-crossing interpolation (discrete fair baseline)")
     ap.add_argument("--rel-thresh", type=float, default=0.5)
     ap.add_argument("--d-model", type=int, default=96)
     ap.add_argument("--device", default="cpu")

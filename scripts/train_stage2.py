@@ -97,6 +97,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--mode", default=None, choices=["feature", "pixel"])
+    ap.add_argument("--visual-token-mode", default=None, choices=["all", "commit"],
+                    help="commit: only event-committed frames become LLM visual tokens")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--allow-default-config", action="store_true")
     add_ddp_args(ap)
@@ -119,6 +121,8 @@ def main():
         args.lora = bool(args.base_model)
 
     cfg = build_cfg(y, manifest, data_root, args.config, args.allow_default_config)
+    if args.visual_token_mode:
+        cfg.visual_token_mode = args.visual_token_mode
     model, tokenizer = build_model(cfg, args)
     if args.base_model and model.cfg.feat_dim != cfg.feat_dim:
         sys.exit(

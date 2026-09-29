@@ -48,6 +48,13 @@ class CSTSSMConfig:
     diff_kv_threshold: float = 0.1
     diff_kv_cpi_sparse: bool = True
     diff_kv_keep_ratio: float = 0.3
+    # Observer branches: their innovation drives the self-supervised predictive-coding
+    # loss and (in "commit" mode) which frames become LLM visual tokens. Long-memory
+    # branches integrate rather than track the observation, so they are excluded.
+    innov_branches: tuple[int, ...] = (0,)
+    # "all": one visual token per frame; "commit": only frames where an observer
+    # branch committed an update, so LLM tokens scale with events, not duration.
+    visual_token_mode: str = "all"
 
 
 def _masked_mse(pred: Tensor, target: Tensor, mask: Tensor | None) -> Tensor:
@@ -57,6 +64,85 @@ def _masked_mse(pred: Tensor, target: Tensor, mask: Tensor | None) -> Tensor:
     m = mask.to(pred.dtype).unsqueeze(-1)
     denom = (m.sum() * pred.shape[-1]).clamp_min(1.0)
     return ((pred - target) ** 2 * m).sum() / denom
+
+
+def innovation_loss(innov: Tensor, frame_mask: Tensor | None,
+                    branches: tuple[int, ...]) -> Tensor:
+    """Mean squared innovation over observer branches and valid frames after the first.
+
+    innov (B,S,L). Frame 0 is excluded: its prediction starts from the zero state.
+    """
+    n = innov[:, list(branches)]
+    valid = (torch.ones_like(n[:, 0], dtype=torch.bool) if frame_mask is None
+             else frame_mask.bool().clone())
+    valid[:, 0] = False
+    w = valid.unsqueeze(1).to(n.dtype).expand_as(n)
+    return (n.pow(2) * w).sum() / w.sum().clamp_min(1.0)
+
+
+def select_committed(visual_states: Tensor, gates: Tensor, frame_mask: Tensor | None,
+                     branches: tuple[int, ...]):
+    """Keep only frames where an observer branch committed an update.
+
+    visual_states (B,L,d), gates (B,S,L). The first valid frame is always kept so
+    every sample has at least one token. Kept states are multiplied by a
+    straight-through factor (forward 1, backward d gate) so the task loss reaches
+    the gate. Returns (states (B,K,d), mask (B,K), keep (B,L)).
+    """
+    B, L, d = visual_states.shape
+    g = gates[:, list(branches)]
+    g_any = 1 - torch.prod(1 - g, dim=1)
+    valid = (torch.ones(B, L, dtype=torch.bool, device=visual_states.device)
+             if frame_mask is None else frame_mask.bool())
+    keep = (g_any.detach() > 0.5) & valid
+    rows = torch.arange(B, device=keep.device)
+    first = torch.argmax(valid.to(torch.int8), dim=1)
+    keep[rows, first] = keep[rows, first] | valid[rows, first]
+    counts = keep.sum(dim=1)
+    K = max(1, int(counts.max()))
+    pos = torch.arange(L, device=keep.device).expand(B, L)
+    idx = torch.where(keep, pos, pos + L).argsort(dim=1)[:, :K]
+    st = (1 + (g_any - g_any.detach())).to(visual_states.dtype)
+    sel = (visual_states * st.unsqueeze(-1)).gather(1, idx.unsqueeze(-1).expand(B, K, d))
+    vmask = torch.arange(K, device=keep.device).unsqueeze(0) < counts.unsqueeze(1)
+    return sel * vmask.unsqueeze(-1).to(sel.dtype), vmask, keep
+
+
+def drop_video_placeholders(input_ids: Tensor, attention_mask: Tensor | None,
+                            labels: Tensor | None, video_token_id: int,
+                            keep: Tensor, frame_mask: Tensor | None, pad_id: int = 0):
+    """Remove placeholder tokens of dropped frames and right-pad the compacted rows.
+
+    Placeholder j of a sample corresponds to its j-th valid frame (the order the
+    placeholder LLM scatters visual states in).
+    """
+    B, T = input_ids.shape
+    valid = (torch.ones_like(keep) if frame_mask is None else frame_mask.bool())
+    tok_keep = torch.ones(B, T, dtype=torch.bool, device=input_ids.device)
+    for b in range(B):
+        ph = (input_ids[b] == video_token_id).nonzero(as_tuple=True)[0]
+        kv = keep[b][valid[b]]
+        if ph.numel() != kv.numel():
+            raise ValueError(f"sample {b}: {ph.numel()} video placeholders vs "
+                             f"{kv.numel()} valid frames")
+        tok_keep[b, ph[~kv]] = False
+    if attention_mask is not None:
+        tok_keep_att = tok_keep & attention_mask.bool()
+    else:
+        tok_keep_att = tok_keep
+    n = tok_keep_att.sum(dim=1)
+    T2 = int(n.max())
+    ids = input_ids.new_full((B, T2), pad_id)
+    att = torch.zeros(B, T2, dtype=(attention_mask.dtype if attention_mask is not None
+                                    else torch.long), device=input_ids.device)
+    lab = None if labels is None else labels.new_full((B, T2), -100)
+    for b in range(B):
+        k = int(n[b])
+        ids[b, :k] = input_ids[b][tok_keep_att[b]]
+        att[b, :k] = 1
+        if lab is not None:
+            lab[b, :k] = labels[b][tok_keep_att[b]]
+    return ids, att, lab
 
 
 class CSTSSMModel(nn.Module):
@@ -85,8 +171,11 @@ class CSTSSMModel(nn.Module):
                 ssm_dim = d * first_branch.n_state * 2
             self.cpib = CPIBDistill(d=d, hidden=cfg.cpib_hidden, ema_alpha=cfg.cpib_ema_alpha,
                                     context_mode=cfg.cpib_context_mode, ssm_state_dim=ssm_dim)
-            from ..train.contrastive import BilinearCritic
-            self.cpib_critic = BilinearCritic(d)
+            from ..train.contrastive import ConditionalCritic
+            # Zero-initialized conditioning path: starts exactly like the plain
+            # bilinear critic, then learns to use the causal history so the NCE
+            # term bounds I(z_{t+1}; z_t | history) rather than unconditional MI.
+            self.cpib_critic = ConditionalCritic(d)
 
         gate_kw = dict(init_eps=cfg.gate_init_eps, gate_kind=cfg.eacs_gate_kind)
         if cfg.cpib_distill and cfg.cpi_modulation > 0:
@@ -172,8 +261,16 @@ class CSTSSMModel(nn.Module):
         visual_states = self.projector(ms.y)
         if self.cpi_sparse_attn is not None and cpi_frame is not None:
             visual_states = self.cpi_sparse_attn(visual_states, cpi=cpi_frame)
+        frame_mask = batch.get("frame_mask")
+        visual_mask, keep = frame_mask, None
+        if self.cfg.visual_token_mode == "commit":
+            visual_states, visual_mask, keep = select_committed(
+                visual_states, ms.gates, frame_mask, self.cfg.innov_branches)
+        elif self.cfg.visual_token_mode != "all":
+            raise ValueError(f"unknown visual_token_mode {self.cfg.visual_token_mode!r}")
         return visual_states, dict(feat=feat, ms=ms, cpi_frame=cpi_frame,
-                                   cpi_tokens=cpi_tokens, tokens=tokens)
+                                   cpi_tokens=cpi_tokens, tokens=tokens,
+                                   visual_mask=visual_mask, keep=keep)
 
     def _llm_takes_need_logits(self) -> bool:
         """Probe once whether the injected LLM accepts the need_logits keyword."""
@@ -197,12 +294,21 @@ class CSTSSMModel(nn.Module):
             diff_loss = self.diff_kv.sequence_reconstruction_loss(
                 visual_states, visual_states)
 
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask")
+        labels = batch.get("labels")
+        keep = aux["keep"]
+        vid = getattr(self.llm, "video_token_id", None)
+        if keep is not None and vid is not None:
+            input_ids, attention_mask, labels = drop_video_placeholders(
+                input_ids, attention_mask, labels, vid, keep, batch.get("frame_mask"))
+
         out = self.llm(
-            input_ids=batch["input_ids"],
+            input_ids=input_ids,
             visual_states=visual_states,
-            attention_mask=batch.get("attention_mask"),
-            visual_mask=batch.get("frame_mask"),
-            labels=batch.get("labels"),
+            attention_mask=attention_mask,
+            visual_mask=aux["visual_mask"],
+            labels=labels,
             **({"need_logits": need_logits} if self._llm_takes_need_logits() else {}),
         )
         out.update(
@@ -213,6 +319,14 @@ class CSTSSMModel(nn.Module):
             residual=ms.residual,
             frame_mask=batch.get("frame_mask"),
         )
+        if ms.innovation is not None:
+            out["innov_loss"] = innovation_loss(ms.innovation, batch.get("frame_mask"),
+                                                self.cfg.innov_branches)
+        if keep is not None:
+            fm = batch.get("frame_mask")
+            n_valid = (fm.sum() if fm is not None else torch.tensor(keep.numel()))
+            out["visual_token_ratio"] = (aux["visual_mask"].sum().float()
+                                         / n_valid.clamp_min(1).float()).detach()
         if diff_loss is not None:
             out["diff_kv_loss"] = diff_loss
         if cpi_frame is not None:
@@ -232,6 +346,7 @@ class CSTSSMModel(nn.Module):
     def measure_kv_compression(self, batch: dict) -> dict:
         """Streaming differential-KV pass; returns compression stats and recon error."""
         assert self.diff_kv is not None, "diff_kv is not enabled (CSTSSMConfig.diff_kv=True)"
+        assert self.cfg.visual_token_mode == "all", "measure_kv_compression needs per-frame tokens"
         visual_states, aux = self.encode_visual(batch)
         feat = aux["feat"]
 
@@ -283,6 +398,9 @@ class CSTSSMModel(nn.Module):
             "spectral_reg": self.temporal.spectral_reg(),
             "frame_mask": batch.get("frame_mask"),
         }
+        if ms.innovation is not None:
+            out["innov_loss"] = innovation_loss(ms.innovation, batch.get("frame_mask"),
+                                                self.cfg.innov_branches)
         if cpi_frame is not None:
             out["cpi_frame"] = cpi_frame
             out["cpi_tokens"] = cpi_tokens

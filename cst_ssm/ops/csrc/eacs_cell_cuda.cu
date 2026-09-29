@@ -116,26 +116,42 @@ __global__ void eacs_cell_fwd_kernel(
         float g = sg;
 
         // ---- Phase C1：更新/选择/输出 + 提交 h_pi,u_pi（读 B_pi/C_pi 旧值）----
+        // g<=0.5（跳过帧）只走预测分支：不算 cexp/cexpm1/hupd，
+        // 使事件稀疏真正转化为算力节省（设计方案 §6.4）。
         for (int h = tid; h < H; h += nth) {
-            float dte = delta * expf(log_dt[h]);
-            dte = fminf(fmaxf(dte, dt_min), dt_max);
             float ul = u[(b * L + l) * H + h];
-            float upi = u_pi[b * H + h];
             float yk = 0.f;
-            for (int n = 0; n < N; ++n) {
-                cf lam_hn = lam[h * N + n];
-                cf z = cscale(lam_hn, dte);
-                cf dA = cexp(z);
-                cf dBbar = cexpm1(z) / lam_hn;
-                cf hpi = h_pi[(b * H + h) * N + n];
-                cf xhat = dA * hpi + cscale(dBbar * B_pi[b * N + n], upi);
-                cf hupd = dA * hpi + cscale(dBbar * Bc[(b * L + l) * N + n], ul);
-                cf hcur = (g > 0.5f) ? hupd : xhat;
-                if (g > 0.5f) h_pi[(b * H + h) * N + n] = hupd;
-                yk += (Cc[(b * L + l) * N + n] * hcur).real();
+            if (g > 0.5f) {
+                float dte = delta * expf(log_dt[h]);
+                dte = fminf(fmaxf(dte, dt_min), dt_max);
+                float upi = u_pi[b * H + h];
+                for (int n = 0; n < N; ++n) {
+                    cf lam_hn = lam[h * N + n];
+                    cf z = cscale(lam_hn, dte);
+                    cf dA = cexp(z);
+                    cf dBbar = cexpm1(z) / lam_hn;
+                    cf hupd = dA * h_pi[(b * H + h) * N + n]
+                            + cscale(dBbar * Bc[(b * L + l) * N + n], ul);
+                    h_pi[(b * H + h) * N + n] = hupd;
+                    yk += (Cc[(b * L + l) * N + n] * hupd).real();
+                }
+                u_pi[b * H + h] = ul;
+            } else {
+                // 跳过帧复用 Phase A 同款预测分支（B_pi/C_pi/u_pi/t_pi 均未变）
+                float dte = delta * expf(log_dt[h]);
+                dte = fminf(fmaxf(dte, dt_min), dt_max);
+                float upi = u_pi[b * H + h];
+                for (int n = 0; n < N; ++n) {
+                    cf lam_hn = lam[h * N + n];
+                    cf z = cscale(lam_hn, dte);
+                    cf dA = cexp(z);
+                    cf dBbar = cexpm1(z) / lam_hn;
+                    cf xhat = dA * h_pi[(b * H + h) * N + n]
+                            + cscale(dBbar * B_pi[b * N + n], upi);
+                    yk += (Cc[(b * L + l) * N + n] * xhat).real();
+                }
             }
             y_out[(b * L + l) * H + h] = yk + Dp[h] * ul;
-            if (g > 0.5f) u_pi[b * H + h] = ul;
         }
         __syncthreads();   // 确保所有通道读完 B_pi/C_pi 再提交
 

@@ -65,6 +65,78 @@ def mean(xs: Sequence[float]) -> float:
     return sum(xs) / len(xs) if xs else float("nan")
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction for the incomplete beta function (Lentz's method)."""
+    tiny, eps = 1e-30, 3e-16
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, 300):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _betai(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbeta = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+             + a * math.log(x) + b * math.log1p(-x))
+    front = math.exp(lbeta)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - math.exp(
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + b * math.log1p(-x) + a * math.log(x)) * _betacf(b, a, 1.0 - x) / b
+
+
+def paired_t_test(a: Sequence[float], b: Sequence[float]) -> tuple[float, float]:
+    """Two-sided paired t-test on per-sample scores; returns (t, p).
+
+    Pure-python (no scipy): p via the regularized incomplete beta function.
+    Used by the CSG fair-baseline protocol (设计方案 §6.3): a = continuous-query
+    errors, b = discrete-model + same-interpolation errors.
+    """
+    assert len(a) == len(b) and len(a) >= 2, "paired_t_test needs equal-length, n>=2"
+    diffs = [x - y for x, y in zip(a, b)]
+    n = len(diffs)
+    md = mean(diffs)
+    var = sum((d - md) ** 2 for d in diffs) / (n - 1)
+    if var < 1e-24:
+        if abs(md) < 1e-12:
+            return 0.0, 1.0   # no difference at all: t=0, two-sided p=1
+        return (float("inf") if md > 0 else float("-inf")), 0.0
+    t = md / math.sqrt(var / n)
+    p = _betai(0.5 * (n - 1), 0.5, (n - 1) / ((n - 1) + t * t))
+    return t, p
+
+
 def write_jsonl(path: str, rows: Iterable[dict]) -> int:
     n = 0
     with open(path, "w", encoding="utf-8") as f:

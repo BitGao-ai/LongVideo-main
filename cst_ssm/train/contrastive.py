@@ -26,22 +26,72 @@ class BilinearCritic(nn.Module):
         return torch.einsum("...d,de,...e->...", z, self.effective_W, zp)
 
 
-def conditional_infonce_loss(z: Tensor, z_future: Tensor, critic: BilinearCritic,
+class ConditionalCritic(nn.Module):
+    """History-conditioned bilinear critic f(z, z'; c) = z^T W z' + (U c)^T z'.
+
+    The context c summarizes the causal history, so the score predicts the
+    future *given the past* -- the CPC-style conditional mutual information
+    lower bound, not the unconditional MI between two adjacent frames.
+    """
+
+    def __init__(self, dim: int, ctx_dim: int | None = None, rank: int | None = None):
+        super().__init__()
+        ctx_dim = dim if ctx_dim is None else ctx_dim
+        self.rank = dim if rank is None else rank
+        self.bilinear = BilinearCritic(dim)
+        self.U = nn.Linear(ctx_dim, self.rank, bias=False)
+        self.V = nn.Linear(dim, self.rank, bias=False)
+        nn.init.zeros_(self.U.weight)
+
+    def forward(self, z: Tensor, zp: Tensor, ctx: Tensor) -> Tensor:
+        """z (N,d), zp (M,d), ctx (N,d_ctx) -> scores (N,M)."""
+        base = (z @ self.bilinear.effective_W) @ zp.t()
+        cond = (self.U(ctx) @ self.V(zp).t())
+        return base + cond
+
+
+def causal_history(z: Tensor) -> Tensor:
+    """Detached exclusive-shift history context: c_t = sg[z_{t-1}], c_0 = 0.
+
+    A minimal strictly-causal conditioning signal; callers may pass a richer
+    context (e.g. projected EACS committed states) instead.
+    """
+    ctx = torch.zeros_like(z)
+    ctx[:, 1:] = z[:, :-1]
+    return ctx.detach()
+
+
+def conditional_infonce_loss(z: Tensor, z_future: Tensor, critic: nn.Module,
                              temperature: float = 0.1,
-                             frame_mask: Tensor | None = None) -> Tensor:
-    """Conditional InfoNCE: z_t predicts the pre-shifted future frame z_future[t].
+                             frame_mask: Tensor | None = None,
+                             context: Tensor | None = None) -> Tensor:
+    """History-conditional InfoNCE: z_t predicts the pre-shifted future frame.
+
+    With a ConditionalCritic (or any critic taking 3 args) the score is
+    conditioned on the causal history c_t, bounding I(z_{t+1}; z_t | c_t).
+    With a plain BilinearCritic this falls back to the unconditional form.
 
     Args:
         z: (B, L, d) current frame features.
         z_future: (B, L, d) aligned future features (caller pre-shifts).
         frame_mask: (B, L) validity mask.
+        context: optional (B, L, d_ctx) causal history; defaults to
+            causal_history(z) when the critic is conditional.
     """
     B, L, d = z.shape
     if L < 2:
         return z.sum() * 0.0
 
+    conditional = isinstance(critic, ConditionalCritic)
+    if conditional and context is None:
+        context = causal_history(z)
+
     z_t = z[:, :-1].reshape(-1, d)
     z_pos = z_future[:, :-1].reshape(-1, d).detach()
+    ctx_t = None
+    if conditional:
+        d_ctx = context.shape[-1]
+        ctx_t = context[:, :-1].reshape(-1, d_ctx)
 
     if frame_mask is not None:
         valid = (frame_mask[:, :-1] & frame_mask[:, 1:]).reshape(-1)
@@ -49,12 +99,17 @@ def conditional_infonce_loss(z: Tensor, z_future: Tensor, critic: BilinearCritic
             return z.sum() * 0.0
         z_t = z_t[valid]
         z_pos = z_pos[valid]
+        if ctx_t is not None:
+            ctx_t = ctx_t[valid]
 
     N = z_t.shape[0]
     if N < 2:
         return z.sum() * 0.0
 
-    logits = (z_t @ critic.effective_W) @ z_pos.t() / temperature
+    if conditional:
+        logits = critic(z_t, z_pos, ctx_t) / temperature
+    else:
+        logits = (z_t @ critic.effective_W) @ z_pos.t() / temperature
     labels = torch.arange(N, device=z.device)
     loss = F.cross_entropy(logits, labels)
     return loss

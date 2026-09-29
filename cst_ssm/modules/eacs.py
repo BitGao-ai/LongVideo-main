@@ -5,6 +5,12 @@ committed state x_pi over the gap (t_k - t_pi):
     predict (skip): xhat_k = Abar(t_k-t_pi) x_pi + Bbar(t_k-t_pi; B_pi) u_pi
     update:         x_k   = Abar(t_k-t_pi) x_pi + Bbar(t_k-t_pi; B_k) u_k
     gate:           r_k = ||u_k - yhat_k|| / (||u_k|| + eta); skips keep commits.
+    innovation:     same residual with the observation detached (stop-gradient target);
+                    its square is the self-supervised predictive-coding loss that makes
+                    yhat_k a real prediction of u_k, so r_k measures novelty.
+                    This closes the gate-semantics gap in Theorem 1 and replaces the
+                    pseudo-inverse argument of Lemma 1 with an output-space bound over
+                    the observable subspace (paper/CST-SSM-CVPR论文设计方案.md §3).
 Single-branch cost is O(L) sequential (gating breaks associativity).
 SSM math runs in float32 complex; outputs are cast back to the input dtype.
 """
@@ -30,6 +36,7 @@ class EACSOutput:
     gates: Tensor          # (B, L) per-step gates (1 = update, 0 = skip)
     update_rate: Tensor    # scalar mean(gate)
     residual: Tensor       # (B, L) normalized prediction residuals
+    innovation: Tensor | None = None  # (B, L) residual vs detached target; None on fused paths
 
 
 def _readout(h: Tensor, C: Tensor) -> Tensor:
@@ -70,8 +77,16 @@ def _standardize(x: Tensor, p: StepParams) -> Tensor:
 
 
 def eacs_step(p: StepParams, h_pi, t_pi, u_pi, B_pi, C_pi,
-              t_k, u_k, B_k, C_k, eps_override=None, cpi_k=None):
-    """One segment cell; returns (h_cur, y_k, gate, r, new commits...)."""
+              t_k, u_k, B_k, C_k, eps_override=None, cpi_k=None,
+              skip_compute=False):
+    """One segment cell; returns (h_cur, y_k, gate, r, innov, new commits...).
+
+    skip_compute: inference-only fast path. When the (hard) gate skips, the
+    update branch h_upd and its output readout are not computed at all, so a
+    skipped frame costs only the prediction branch -- skipped updates then
+    genuinely save FLOPs instead of being mixed away. Requires hard gates
+    (not training), where g in {0, 1} makes the blend below exact.
+    """
     if p.disc_mode == "learned":
         dt_eff = F.softplus(p.proj_dt(u_k)).clamp(1e-3, 1e3)
     else:
@@ -88,9 +103,28 @@ def eacs_step(p: StepParams, h_pi, t_pi, u_pi, B_pi, C_pi,
     y_hat = _readout(x_hat, C_pi)
 
     obs = _standardize(u_k, p)
+    y_hat_s = _standardize(y_hat, p)
     eps_ov = eps_override if eps_override is not None else p.eps
-    g, r = p.gate(obs, _standardize(y_hat, p), eps_override=eps_ov,
+    g, r = p.gate(obs, y_hat_s, eps_override=eps_ov,
                   cpi=cpi_k, temp_override=p.temperature)
+    innov = p.gate.residual(obs.detach(), y_hat_s)
+
+    if skip_compute and not torch.is_grad_enabled():
+        # Hard-gate inference: run the update branch only where the gate fires.
+        gs = g[..., None, None]
+        gv = g[..., None]
+        fire = g > 0.5
+        h_cur = x_hat
+        if bool(fire.any()):
+            h_upd = h_free + zoh_apply_B(dB_bar, B_k) * u_k.unsqueeze(-1)
+            h_cur = torch.where(fire[..., None, None], h_upd, x_hat)
+        y_k = _readout(h_cur, C_k) + p.D * u_k
+        h_pi_n = gs * h_cur + (1 - gs) * h_pi
+        t_pi_n = g * t_k + (1 - g) * t_pi
+        u_pi_n = gv * u_k + (1 - gv) * u_pi
+        B_pi_n = gv * B_k + (1 - gv) * B_pi
+        C_pi_n = gv * C_k + (1 - gv) * C_pi
+        return h_cur, y_k, g, r, innov, h_pi_n, t_pi_n, u_pi_n, B_pi_n, C_pi_n
 
     h_upd = h_free + zoh_apply_B(dB_bar, B_k) * u_k.unsqueeze(-1)
 
@@ -106,14 +140,15 @@ def eacs_step(p: StepParams, h_pi, t_pi, u_pi, B_pi, C_pi,
     C_pi_n = gv * C_k + (1 - gv) * C_pi
 
     y_k = _readout(h_cur, C_k) + p.D * u_k
-    return h_cur, y_k, g, r, h_pi_n, t_pi_n, u_pi_n, B_pi_n, C_pi_n
+    return h_cur, y_k, g, r, innov, h_pi_n, t_pi_n, u_pi_n, B_pi_n, C_pi_n
 
 
 def scan_range(p: StepParams, state, u, Bc, Cc, t, k0, k1,
-               cpi=None, robust: RobustCfg | None = None):
-    """Scan [k0, k1); returns (ys, gs, rs, final state)."""
+               cpi=None, robust: RobustCfg | None = None,
+               skip_compute: bool = False):
+    """Scan [k0, k1); returns (ys, gs, rs, innovations, final state)."""
     h_pi, t_pi, u_pi, B_pi, C_pi = state
-    ys, gs, rs = [], [], []
+    ys, gs, rs, ns = [], [], [], []
     spike = prev_r = base_eps = None
     if robust is not None:
         spike = torch.zeros_like(t_pi)
@@ -123,18 +158,20 @@ def scan_range(p: StepParams, state, u, Bc, Cc, t, k0, k1,
         if robust is not None:
             eps_ov = torch.where(spike >= robust.k,
                                  base_eps * robust.eps_factor, base_eps)
-        h_cur, y_k, g, r, h_pi, t_pi, u_pi, B_pi, C_pi = eacs_step(
+        h_cur, y_k, g, r, n, h_pi, t_pi, u_pi, B_pi, C_pi = eacs_step(
             p, h_pi, t_pi, u_pi, B_pi, C_pi,
             t[:, k], u[:, k], Bc[:, k], Cc[:, k], eps_override=eps_ov,
-            cpi_k=(cpi[:, k] if cpi is not None else None))
-        ys.append(y_k); gs.append(g); rs.append(r)
+            cpi_k=(cpi[:, k] if cpi is not None else None),
+            skip_compute=skip_compute)
+        ys.append(y_k); gs.append(g); rs.append(r); ns.append(n)
         if robust is not None:
             if prev_r is not None:
                 is_spike = r > prev_r * robust.spike_ratio
                 spike = torch.where(is_spike, spike + 1.0, torch.zeros_like(spike))
             prev_r = r.detach()
     ys = torch.stack(ys, 1); gs = torch.stack(gs, 1); rs = torch.stack(rs, 1)
-    return ys, gs, rs, (h_pi, t_pi, u_pi, B_pi, C_pi)
+    ns = torch.stack(ns, 1)
+    return ys, gs, rs, ns, (h_pi, t_pi, u_pi, B_pi, C_pi)
 
 
 
@@ -248,8 +285,15 @@ class EACSLayer(nn.Module):
 
     def _scan_range(self, lam, state, u, Bc, Cc, t, k0, k1, cpi=None):
         """Scan [k0, k1); cpi is an optional (B,L) frame-level signal."""
+        # Inference with a hard event gate: skip the update branch on skipped
+        # frames so event sparsity translates into real compute savings.
+        skip_compute = (not self.training
+                        and self.disc_mode == "continuous"
+                        and getattr(self.gate, "gate_kind", "event") == "event"
+                        and self.robust_guard is False)
         return scan_range(self.step_params(lam), state, u, Bc, Cc, t, k0, k1,
-                          cpi=cpi, robust=self._robust_cfg())
+                          cpi=cpi, robust=self._robust_cfg(),
+                          skip_compute=skip_compute)
 
     def _update_obs_stats(self, u: Tensor, frame_mask: Tensor | None) -> None:
         """Update running observation stats from valid frames only."""
@@ -299,22 +343,23 @@ class EACSLayer(nn.Module):
 
         cs = self.chunk_size
         if self.training and cs and cs > 0 and L > cs:
-            ys = gs = rs = None
+            ys = gs = rs = ns = None
             for k0 in range(0, L, cs):
                 k1 = min(k0 + cs, L)
-                y_c, g_c, r_c, state = ckpt.checkpoint(
+                y_c, g_c, r_c, n_c, state = ckpt.checkpoint(
                     self._scan_range, lam, state, u, Bc, Cc, t, k0, k1, cpi,
                     use_reentrant=False)
                 ys = _write_chunk(ys, y_c, L, k0, k1)
                 gs = _write_chunk(gs, g_c, L, k0, k1)
                 rs = _write_chunk(rs, r_c, L, k0, k1)
-                del y_c, g_c, r_c
+                ns = _write_chunk(ns, n_c, L, k0, k1)
+                del y_c, g_c, r_c, n_c
         else:
-            ys, gs, rs, state = self._scan_range(lam, state, u, Bc, Cc, t, 0, L, cpi=cpi)
+            ys, gs, rs, ns, state = self._scan_range(lam, state, u, Bc, Cc, t, 0, L, cpi=cpi)
 
         delta = self.proj_out(ys.to(x_in.dtype))
         y = x_in + delta if self.add_residual else delta
-        return EACSOutput(y=y, gates=gs, update_rate=gs.mean(), residual=rs)
+        return EACSOutput(y=y, gates=gs, update_rate=gs.mean(), residual=rs, innovation=ns)
 
     @torch.no_grad()
     def _forward_fused(self, x: Tensor, timestamps: Tensor) -> EACSOutput:
@@ -345,7 +390,7 @@ class EACSLayer(nn.Module):
         H, T, U, Bs, Cs = [], [], [], [], []
         p = self.step_params(lam)
         for k in range(k0, k1):
-            _, y_k, g, r, h_pi, t_pi, u_pi, B_pi, C_pi = eacs_step(
+            _, y_k, g, r, _, h_pi, t_pi, u_pi, B_pi, C_pi = eacs_step(
                 p, h_pi, t_pi, u_pi, B_pi, C_pi, t[:, k], u[:, k], Bc[:, k], Cc[:, k],
                 cpi_k=(cpi[:, k] if cpi is not None else None))
             ys.append(y_k); gs.append(g); rs.append(r)
