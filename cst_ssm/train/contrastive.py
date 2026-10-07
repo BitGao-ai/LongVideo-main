@@ -29,9 +29,9 @@ class BilinearCritic(nn.Module):
 class ConditionalCritic(nn.Module):
     """History-conditioned bilinear critic f(z, z'; c) = z^T W z' + (U c)^T z'.
 
-    The context c summarizes the causal history, so the score predicts the
-    future *given the past* -- the CPC-style conditional mutual information
-    lower bound, not the unconditional MI between two adjacent frames.
+    The critic is history-conditioned, but cross-history negatives do not yield
+    a conditional mutual-information bound. Use conditional_candidate_infonce
+    only with independent negatives from the *same* p(Y | C).
     """
 
     def __init__(self, dim: int, ctx_dim: int | None = None, rank: int | None = None):
@@ -67,9 +67,9 @@ def conditional_infonce_loss(z: Tensor, z_future: Tensor, critic: nn.Module,
                              context: Tensor | None = None) -> Tensor:
     """History-conditional InfoNCE: z_t predicts the pre-shifted future frame.
 
-    With a ConditionalCritic (or any critic taking 3 args) the score is
-    conditioned on the causal history c_t, bounding I(z_{t+1}; z_t | c_t).
-    With a plain BilinearCritic this falls back to the unconditional form.
+    This is a history-conditioned contrastive surrogate with cross-history
+    negatives, NOT a conditional mutual-information estimator. A conditional
+    critic alone cannot repair the negative sampling distribution.
 
     Args:
         z: (B, L, d) current frame features.
@@ -123,8 +123,13 @@ def information_bottleneck_kl(scores: Tensor, rho: float = 0.3,
         scores: (B, L, P) CGU keep scores.
         rho: target keep rate.
     """
+    if not 0 < rho < 1:
+        raise ValueError("rho must be strictly between zero and one")
     eps = 1e-7
-    s = scores.clamp(eps, 1 - eps)
+    s = scores.float() if scores.dtype in (torch.float16, torch.bfloat16) else scores
+    if frame_mask is not None:
+        s = torch.where(frame_mask.bool().unsqueeze(-1), s, 0.5)
+    s = s.clamp(eps, 1 - eps)
     kl = s * torch.log(s / rho) + (1 - s) * torch.log((1 - s) / (1 - rho))
 
     if frame_mask is not None:
@@ -145,7 +150,9 @@ def counterfactual_consistency_loss(
     frame_mask: Tensor | None = None,
     ablate_frac: float = 0.1,
 ) -> Tensor:
-    """Counterfactual consistency: ablated-token scores track per-frame marginal effects.
+    """Legacy representation-sensitivity regularizer, not future causal impact.
+
+    Adaptive CPIB instead calibrates future prediction damage in adaptive_path.py.
 
     Args:
         scores: (B, L, P) CGU scores.
@@ -196,6 +203,7 @@ class CPIBWeights:
     cf_ablate_frac: float = 0.1
     rho: float = 0.3
     cf_anneal_steps: int = 2000
+    representation: float = 0.001
 
 
 def cpib_loss(

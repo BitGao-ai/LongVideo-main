@@ -1,5 +1,6 @@
 # CST-SSM 训练与推理运行指令
 
+> 当前默认配置已切换为EACS＋adaptive CPIB。下文40G/80G配方是既有运行参考，**尚未重新验证新路径的GPU峰值显存与吞吐**；数学与能力边界以 [实施审计](paper/IMPLEMENTATION_AUDIT.md) 为准。
 > 覆盖三类形态：单卡 40G、单卡 80G、单机 8 卡（每卡 40G）。
 > 所有脚本 `--device` 默认为 `cpu`，GPU 训练必须显式传 `--device cuda`（bf16 会随之自动开启）。
 > 统一使用 `python3` 执行。
@@ -121,7 +122,7 @@ python3 -m data_pipeline.src.extract_features ... --shard 0/8
 | 参数 | 说明 |
 |---|---|
 | `--skip-existing` | **默认关**（每次全量重抽）。断点续跑 / 增量必须显式加 |
-| `--dt-max` | 静止段兜底间隔，**直接决定定位精度地板 δ/4**：2.0→0.5s，4.0→1.0s |
+| `--dt-max` | 静止段兜底观测间隔；不是一般定位误差下界。δ/4仅对应特定最近网格量化假设，连续回归/插值不受该输出限制 |
 | `--max-frames` | 帧数**上限不是目标**；必须与 `configs/default.yaml` 的 `data.max_frames`（8192）一致，否则训练侧会再抽稀一次 |
 | `--patches` | 空间池化 P：1 / 9 / 64。P=9 推荐（d=2560 fp16 时约 45 KB/帧） |
 | `--video-root` | 只在 manifest 用 `rel_path` 时需要；有 `video_path` 时留空 |
@@ -147,7 +148,7 @@ for p in sorted(glob.glob('data/features/*.npz'))[:3]:
 ```
 
 `decimate_ratio != 1.0`（即 `raw > L`）说明 `--max-frames` 在这些视频上咬过人、
-`--dt-max` 的间隔契约已失效——**定位精度地板不再是 δ/4**，写论文的定位精度声明前必须查这一项。
+`--dt-max` 的观测间隔契约可能已失效；定位比较必须使用实际时间戳及相同观测预算，不能从名义间隔直接推导通用误差地板。
 `d` 与 `model` 是溯源三件套的一部分：`sampler_fp` 只能回答"参数变没变"，回答不了"这批特征是谁抽的"。
 
 #### ④ `.npz` → `.npy`（规模化必做，不是可选）
@@ -248,16 +249,12 @@ python3 -m data_pipeline.src.qa_eval \
 python3 -m data_pipeline.src.qa_eval --manifest data/manifests/lvb_val.jsonl --demo
 ```
 
-> ⚠️ **`infer_qa` 没有 `--base-model`，接过真底座的检查点不能用它评测。**
-> 它只会建 stand-in LLM（`vocab=259` 的字节级小模型）。把接 Qwen3-VL 训出来的检查点喂给它，
-> 只是把 CST-SSM 段加载进一个语言能力为零的壳里，照样输出一份**看不出异常的假准确率**——
-> §5 里 `eval_benchmark.py` 那道 `trainable_only` 硬退出护栏**在这里不存在**。
->
-> **判据**：接过 `--base-model` 训练的检查点走 §5 的
-> `eval_benchmark.py --mode qa --base-model ...`；`infer_qa` 只用于 stand-in 下的链路/格式自测，
-> 或本来就没接底座的检查点。
-> 另外 `--config` 不传时它按 `d_model=96` 建模型——那是 smoke 尺寸，和 §2 那条
-> "stage-1 少传 `--config`"是同一个坑。
+> `infer_qa` 已与 `eval_benchmark.py`、grounding 推理共用模型恢复接口，支持 Qwen 和 stand-in。
+> 新检查点会保存实际配置、基础模型、tokenizer、精度和 LoRA 参数；推理优先从 metadata 恢复。
+> 旧 Qwen 检查点必须补充训练时的 `--base-model`、`--config`、`--lora-r/--lora-alpha`
+> （无 LoRA 时用 `--no-lora`）。不会静默将 Qwen 权重加载到 stand-in 中评分。
+> 原 YAML 的 `feat_dim` 若在训练时经自动对齐，以保存的实际配置为准；真实输入特征维度不符则报错。
+> 没有 checkpoint/config 的路径仍只是随机初始化的 smoke 模型，不代表真实 QA 质量。
 
 ### 0.2.4 无 GPU 本机自测（验证链路，不验证数值）
 
@@ -428,7 +425,7 @@ python3 scripts/train_qwen3vl.py --device cuda \
 > `--base-model` 给了之后 `--lora` 默认就是开的（`train_stage2.py` 里
 > `args.lora = bool(args.base_model)`），显式写出来只是为了可读性。关掉要用 `--no-lora`。
 
-## 5. 推理与评测（单卡即可，推理状态为 O(1)，两种显存形态通用）
+## 5. 推理与评测（递推状态与视频长度无关，历史索引/Token/LLM KV另计）
 
 ```bash
 # 流式推理效率演示

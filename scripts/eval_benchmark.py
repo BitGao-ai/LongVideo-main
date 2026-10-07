@@ -23,15 +23,10 @@ import torch
 def _build_cfg(args):
     """Restore the model config from config.yaml next to the checkpoint, else defaults."""
     from cst_ssm.models import CSTSSMConfig
-    from cst_ssm.utils import model_config_from_dict, load_yaml
-    cfg_path = args.config or os.path.join(os.path.dirname(args.ckpt or "."), "config.yaml")
-    if cfg_path and os.path.exists(cfg_path):
-        y = load_yaml(cfg_path)
-        cfg_dict = y.get("model") if isinstance(y.get("model"), dict) else y
-        print(f"[eval] config from {cfg_path}")
-        return model_config_from_dict(cfg_dict)
-    print("[eval][warn] no config.yaml found; using default config")
-    return CSTSSMConfig(input_mode="feature", feat_dim=768, d_model=768)
+    from cst_ssm.utils.restoration import resolve_model_config
+    return resolve_model_config(args.ckpt, args.config,
+                                default=CSTSSMConfig(input_mode="feature", feat_dim=768, d_model=768),
+                                allow_config_override=getattr(args, "max_missing_ratio", None) is not None)
 
 
 def _preflight_ckpt(args):
@@ -59,42 +54,16 @@ def load_model(args):
         print("[eval] stand-in model")
         return CSTSSMModel(cfg).to(args.device).eval(), None
 
-    from cst_ssm.utils import load_checkpoint
-    from cst_ssm.utils.checkpoint import CRITICAL_SHAPE_PREFIXES
-    _DEFAULT_MAX_MISSING_RATIO = 0.02
-    cfg = _build_cfg(args)
-    _preflight_ckpt(args)
-
-    if args.base_model:
-        from cst_ssm.integrations.qwen3_vl import build_cstssm_qwen3vl
-        from cst_ssm.data import build_hf_tokenizer
-        from cst_ssm.models import assert_config_applied
-        print(f"[eval] base: {args.base_model} (lora={args.lora}, r={args.lora_r})")
-        model = build_cstssm_qwen3vl(
-            model_name=args.base_model, base_cfg=cfg, lora=args.lora,
-            lora_r=args.lora_r, lora_alpha=args.lora_alpha, dtype=args.dtype)
-        assert_config_applied(model, cfg)
-        tok = build_hf_tokenizer(args.base_model, max_video_tokens=args.max_video_tokens)
-        if args.ckpt:
-            load_checkpoint(model, args.ckpt, max_missing_ratio=0.99, tag="eval")
-        else:
-            print("[eval][warn] no --ckpt: random weights, metrics are meaningless")
-        return model.to(args.device).eval(), tok
-
-    from cst_ssm.models import CSTSSMModel
-    model = CSTSSMModel(cfg)
-    if args.ckpt:
-        _forced = args.max_missing_ratio is not None
-        if _forced:
-            print(f"[eval][warn] explicit max_missing_ratio={args.max_missing_ratio}: "
-                  f"results are not reportable")
-        load_checkpoint(model, args.ckpt,
-                        max_missing_ratio=(args.max_missing_ratio
-                                           if _forced else _DEFAULT_MAX_MISSING_RATIO),
-                        tag="eval",
-                        critical_prefixes=() if _forced else CRITICAL_SHAPE_PREFIXES)
-    print(f"[eval] model loaded: {args.ckpt}")
-    return model.to(args.device).eval(), None
+    from cst_ssm.utils.restoration import restore_model
+    from cst_ssm.models import CSTSSMConfig
+    from cst_ssm.data import infer_feat_dim
+    feat_dim = infer_feat_dim(args.manifest, args.data_root) if args.manifest else None
+    return restore_model(
+        ckpt=args.ckpt, config=args.config, feat_dim=feat_dim,
+        default=CSTSSMConfig(input_mode="feature", feat_dim=768, d_model=768),
+        device=args.device, base_model=args.base_model, dtype=args.dtype,
+        lora=args.lora, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+        max_video_tokens=args.max_video_tokens, max_missing_ratio=args.max_missing_ratio)
 
 
 def _mcq_answer_index(row: dict):
@@ -161,7 +130,7 @@ def eval_qa(model, args, tokenizer=None):
             with _eval_autocast(args):
                 out = model(batch)
             logits = out.get("logits")
-            labels = batch.get("labels")
+            labels = out.get("effective_labels", batch.get("labels"))
             if logits is None or labels is None:
                 continue
             B = labels.shape[0]
@@ -191,10 +160,11 @@ def eval_qa(model, args, tokenizer=None):
                         correct += 1
                     total += 1
             else:
-                valid = labels != -100
+                targets = labels[:, 1:]
+                valid = targets != -100
                 if valid.any():
-                    preds = logits.argmax(dim=-1)
-                    correct += (preds[valid] == labels[valid]).sum().item()
+                    preds = logits[:, :-1].argmax(dim=-1)
+                    correct += (preds[valid] == targets[valid]).sum().item()
                     total += valid.sum().item()
 
     elapsed = time.time() - t0
@@ -284,8 +254,8 @@ def main():
     ap.add_argument("--dtype", default=None)
     ap.add_argument("--lora", action="store_true", default=None)
     ap.add_argument("--no-lora", dest="lora", action="store_false")
-    ap.add_argument("--lora-r", type=int, default=64)
-    ap.add_argument("--lora-alpha", type=int, default=16)
+    ap.add_argument("--lora-r", type=int, default=None)
+    ap.add_argument("--lora-alpha", type=int, default=None)
     ap.add_argument("--max-video-tokens", type=int, default=8192)
     ap.add_argument("--config", default=None)
     ap.add_argument("--bf16", action="store_true")
@@ -296,8 +266,6 @@ def main():
     if str(args.device).startswith("cuda") and not torch.cuda.is_available():
         print("[warn] CUDA unavailable, falling back to CPU")
         args.device = "cpu"
-    if args.lora is None:
-        args.lora = bool(args.base_model)
     if args.bf16 and args.device == "cpu":
         print("[eval][warn] CPU bf16 autocast validates plumbing only")
 

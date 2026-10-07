@@ -128,10 +128,11 @@ class SSMStateContext(nn.Module):
 
 
 class TokenDistiller(nn.Module):
-    """Soft information-bottleneck compression of tokens to frame features.
+    """Legacy soft pooling to one frame feature; NOT dynamic token pruning.
 
     High-score tokens are kept via weighted mean; low-score content is summarized
-    with attention pooling biased by log(1 - s). Returns frame features and CPI.
+    with attention pooling biased by log(1 - s). No representation-rate bound is
+    implied. The complete packed implementation lives in adaptive_tokens.py.
     """
 
     def __init__(self, d: int, n_heads: int = 8):
@@ -150,7 +151,7 @@ class TokenDistiller(nn.Module):
 
         compressed = single_query_pool(
             self.attn_pool, self.query.reshape(d), tokens,
-            bias=torch.log1p(-scores).clamp_min(-14.0))
+            bias=torch.log1p(-scores.float().clamp(max=1 - 1e-6)).to(tokens.dtype))
 
         g = self.gate(torch.cat([retained, compressed], dim=-1))
         frame_feat = g * retained + (1 - g) * compressed
@@ -159,7 +160,7 @@ class TokenDistiller(nn.Module):
 
 
 class CPIBDistill(nn.Module):
-    """Full CPIB-Distill block: CGU + causal context + token distillation.
+    """Legacy CPIB pooling block, retained for explicit old-checkpoint compatibility.
 
     Inserted between the spatial encoder and the temporal model.
     tokens (B,L,P,d) -> (frame_feat (B,L,d), cpi_frame (B,L), cpi_tokens (B,L,P)).

@@ -34,6 +34,8 @@ def model_config_from_dict(d: dict) -> CSTSSMConfig:
         d["branches"] = branches_from_list(d["branches"])
     if "llm" in d and isinstance(d["llm"], dict):
         d["llm"] = LLMConfig(**d["llm"])
+    if "innov_branches" in d:
+        d["innov_branches"] = tuple(d["innov_branches"])
     known = CSTSSMConfig.__dataclass_fields__.keys()
     unknown = sorted(k for k in d if k not in known)
     if unknown:
@@ -87,7 +89,11 @@ def train_config_from_yaml(y: dict, base=None, skip: set[str] | None = None):
 def loss_weights_from_yaml(y: dict, base=None):
     """YAML [loss] section -> LossWeights."""
     from ..train.losses import LossWeights
-    return _apply_section(base or LossWeights(), y.get("loss"), "loss")
+    from ..train.contrastive import CPIBWeights
+    result = _apply_section(base or LossWeights(), y.get("loss"), "loss")
+    if isinstance(result.cpib, dict):
+        result.cpib = CPIBWeights(**result.cpib)
+    return result
 
 
 def loader_config_from_yaml(y: dict, base=None, skip: set[str] | None = None):

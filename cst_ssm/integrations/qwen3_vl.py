@@ -110,7 +110,7 @@ class Qwen3VLLanguageModel(nn.Module):
                                    device=inputs_embeds.device, dtype=torch.long)
         n_slot_per = placeholder_mask.sum(dim=1)
         n_slots = int(n_slot_per.sum().item())
-        if n_slots == 0:
+        if n_slots == 0 and not bool(n_vis_per.any()):
             return inputs_embeds
         if not bool(torch.equal(n_vis_per, n_slot_per.to(n_vis_per.dtype))):
             bad = (n_vis_per != n_slot_per).nonzero(as_tuple=True)[0].tolist()
@@ -133,11 +133,14 @@ class Qwen3VLLanguageModel(nn.Module):
         embed = self._embed_tokens()
         inputs_embeds = embed(input_ids)
         mask = (input_ids == self.video_token_id)
+        if attention_mask is not None:
+            mask = mask & attention_mask.bool()
         inputs_embeds = self._scatter_visual(inputs_embeds, mask, visual_states, visual_mask)
 
         text_model = self._text_model()
-        hidden = text_model(inputs_embeds=inputs_embeds,
-                            attention_mask=attention_mask).last_hidden_state
+        positions = (attention_mask.long().cumsum(-1) - 1).clamp_min(0) if attention_mask is not None else None
+        hidden = text_model(inputs_embeds=inputs_embeds, position_ids=positions,
+                            attention_mask=attention_mask, use_cache=False).last_hidden_state
         if use_chunked_loss(self.loss_chunk, labels, need_logits):
             return {"loss": chunked_lm_loss(hidden, labels, self._lm_head(),
                                             self.loss_chunk)}
@@ -146,7 +149,88 @@ class Qwen3VLLanguageModel(nn.Module):
         if labels is not None:
             sl = logits[:, :-1].reshape(-1, logits.size(-1))
             sll = labels[:, 1:].reshape(-1)
-            out["loss"] = F.cross_entropy(sl, sll, ignore_index=-100)
+            out["loss"] = (F.cross_entropy(sl, sll, ignore_index=-100)
+                           if bool((sll != -100).any()) else logits.sum() * 0.0)
+        return out
+
+
+    @torch.no_grad()
+    def greedy_decode(self, input_ids: Tensor, visual_states: Tensor,
+                      attention_mask: Tensor | None = None,
+                      visual_mask: Tensor | None = None, max_new_tokens: int = 32,
+                      eos_token_id: int | list[int] | None = None,
+                      pad_token_id: int | None = None,
+                      return_scores: bool = False) -> dict:
+        """Standard (uncompressed) HF KV decoding; visual tokens appear only in prefill.
+
+        Physical cache positions count padding; rotary positions count valid tokens.
+        Neither this method nor DifferentialKVCache compresses the HF cache.
+        """
+        if self.training:
+            raise ValueError("greedy_decode requires eval()")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be nonnegative")
+        configs = (getattr(self.hf, "generation_config", None),
+                   getattr(getattr(self.hf, "config", None), "text_config", None),
+                   getattr(self.hf, "config", None))
+        if eos_token_id is None:
+            eos_token_id = next((getattr(c, "eos_token_id", None) for c in configs
+                                 if getattr(c, "eos_token_id", None) is not None), None)
+        # An explicit empty list requests fixed-length decoding.
+        eos_ids = ([] if eos_token_id is None else
+                   [eos_token_id] if isinstance(eos_token_id, int) else list(eos_token_id))
+        if pad_token_id is None:
+            pad_token_id = next((getattr(c, "pad_token_id", None) for c in configs
+                                 if getattr(c, "pad_token_id", None) is not None),
+                                eos_ids[0] if eos_ids else 0)
+        eos = input_ids.new_tensor(eos_ids)
+        attention = (torch.ones_like(input_ids) if attention_mask is None
+                     else attention_mask.long().clone())
+        if not bool(attention.bool().any(-1).all()):
+            raise ValueError("each prompt needs at least one valid token")
+        embeds = self._embed_tokens()(input_ids)
+        embeds = self._scatter_visual(embeds, (input_ids == self.video_token_id) & attention.bool(),
+                                      visual_states, visual_mask)
+        positions = (attention.cumsum(-1) - 1).clamp_min(0)
+        cache = None
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        generated, masks, scores = [], [], []
+        for step in range(max_new_tokens):
+            result = self._text_model()(inputs_embeds=embeds, attention_mask=attention,
+                                        position_ids=positions, past_key_values=cache,
+                                        use_cache=True)
+            cache = result.past_key_values
+            if cache is None:
+                raise RuntimeError("Qwen text model did not return an incremental KV cache")
+            hidden = result.last_hidden_state
+            if step == 0:
+                indices = torch.arange(attention.shape[1], device=attention.device)[None]
+                last = indices.masked_fill(~attention.bool(), -1).max(-1).values
+                hidden = hidden[torch.arange(hidden.shape[0], device=hidden.device), last]
+            else:
+                hidden = hidden[:, -1]
+            logits = self._lm_head()(hidden)
+            token = logits.argmax(-1)
+            active = ~finished
+            token = torch.where(active, token, token.new_full((), pad_token_id))
+            generated.append(token); masks.append(active)
+            if return_scores:
+                scores.append(logits)
+            if eos.numel():
+                finished = finished | (active & (token[:, None] == eos).any(-1))
+            if bool(finished.all()):
+                break
+            # Next input is the token just emitted. EOS stays a valid cached token;
+            # any later tokens of completed rows are padding.
+            positions = attention.sum(-1, keepdim=True)
+            attention = torch.cat((attention, active[:, None].long()), -1)
+            embeds = self._embed_tokens()(token[:, None])
+        ids = torch.stack(generated, 1) if generated else input_ids[:, :0]
+        mask = torch.stack(masks, 1) if masks else attention[:, :0].bool()
+        out = dict(sequences=torch.cat((input_ids, ids), 1), generated_ids=ids,
+                   generated_mask=mask)
+        if return_scores:
+            out["scores"] = scores
         return out
 
 
@@ -416,8 +500,13 @@ def build_cstssm_qwen3vl(model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
     _lc = int(getattr(_base_llm, "loss_chunk", LLMConfig.loss_chunk))
     if grad_checkpoint is not None:
         _gc = bool(grad_checkpoint)
-    llm_cfg = LLMConfig(vocab_size=hf.config.text_config.vocab_size, dim=hidden,
-                        grad_checkpoint=_gc, loss_chunk=_lc)
+    llm_cfg = replace(_base_llm or LLMConfig(),
+                      vocab_size=hf.config.text_config.vocab_size, dim=hidden,
+                      grad_checkpoint=_gc, loss_chunk=_lc)
+    context_limit = getattr(hf.config.text_config, "max_position_embeddings", None)
+    if llm_cfg.max_len < 1 or (context_limit is not None and llm_cfg.max_len > context_limit):
+        raise ValueError(f"llm.max_len={llm_cfg.max_len} is outside the base model's "
+                         f"context limit ({context_limit})")
 
     if base_cfg is not None:
         cfg = replace(base_cfg, input_mode="feature", feat_dim=feat_dim, llm=llm_cfg)
@@ -430,6 +519,8 @@ def build_cstssm_qwen3vl(model_name: str = "Qwen/Qwen3-VL-4B-Instruct",
     qwen_llm = Qwen3VLLanguageModel(hf, train_base=not lora, grad_checkpoint=_gc,
                                     loss_chunk=_lc)
     model = CSTSSMModel(cfg, llm=qwen_llm)
+    model.restoration_config = dict(backend="qwen3_vl", base_model=model_name,
+                                    tokenizer_model=model_name)
 
     if not keep_visual:
         n_rel, b_rel = _release_visual_tower(hf)

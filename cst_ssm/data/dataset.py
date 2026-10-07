@@ -103,11 +103,16 @@ class VideoTemporalDataset(Dataset):
             ts = np.arange(len(fnames), dtype=np.float32) / 30.0
         return frames, ts
 
-    def _subsample(self, L: int) -> np.ndarray:
-        """Uniform index subsample beyond max_frames, preserving timestamps."""
-        if L <= self.cfg.max_frames:
+    def _subsample(self, L: int, budget: int | None = None) -> np.ndarray:
+        """Use one index selection for frames, timestamps and video placeholders."""
+        limit = min(self.cfg.max_frames, getattr(self.tok, "max_video_tokens", self.cfg.max_frames))
+        if budget is not None:
+            limit = min(limit, budget)
+        if limit < 1:
+            raise ValueError("frame budget must be positive")
+        if L <= limit:
             return np.arange(L)
-        return np.linspace(0, L - 1, self.cfg.max_frames).round().astype(int)
+        return np.linspace(0, L - 1, limit).round().astype(int)
 
     def __getitem__(self, i: int) -> dict:
         """Load one sample; failed rows are replaced by a random row (counted)."""
@@ -143,14 +148,16 @@ class VideoTemporalDataset(Dataset):
 
     def _load_sample(self, i: int) -> dict:
         r = self.rows[i]
+        budget = (self.tok.video_budget(self.cfg.max_text_len, r.get("answer", ""))
+                  if hasattr(self.tok, "video_budget") and "<video>" in r["prompt"] else None)
         if self._pixel and r.get("frame_dir"):
             frames, ts = self._load_pixel_frames(r["frame_dir"])
-            idx = self._subsample(len(ts))
+            idx = self._subsample(len(ts), budget)
             vis = frames[idx]
             ts = torch.from_numpy(ts[idx]).float()
         else:
             feats, ts = self._load_feature(r["feature_ref"])
-            idx = self._subsample(len(ts))
+            idx = self._subsample(len(ts), budget)
             vis = torch.from_numpy(np.ascontiguousarray(feats[idx]))
             vis = self._cast_feat(vis)
             ts = torch.from_numpy(ts[idx]).float()
@@ -173,6 +180,13 @@ class VideoTemporalDataset(Dataset):
     def _fallback_sample(self) -> dict:
         """Zero-feature placeholder when no real sample is loadable."""
         L, P, d = 4, self.cfg.feat_patches, self.cfg.feat_dim
+        max_len = self.cfg.max_text_len
+        prompt = ""
+        if hasattr(self.tok, "set_video_tokens"):
+            L = min(L, self.tok.video_budget(max_len))
+            self.tok.set_video_tokens(L)
+            prompt = "<video>"
+        ids, _ = self.tok.build_lm_example(prompt, "", max_len)
         vkey = "frames" if self._pixel else "features"
         if self._pixel:
             vis = torch.zeros(L, 3, self.cfg.frame_size, self.cfg.frame_size)
@@ -181,8 +195,8 @@ class VideoTemporalDataset(Dataset):
         return {
             vkey: vis,
             "timestamps": torch.arange(L, dtype=torch.float32),
-            "input_ids": torch.tensor([self.tok.BOS, self.tok.EOS], dtype=torch.long),
-            "labels": torch.tensor([-100, self.tok.EOS], dtype=torch.long),
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "labels": torch.full((len(ids),), -100, dtype=torch.long),
             "row_index": -1,
         }
 

@@ -70,35 +70,26 @@ data_pipeline/
 > 裸 `--device cuda` 自动映射到 `cuda:LOCAL_RANK`，无需手写 `CUDA_VISIBLE_DEVICES`）；
 > 手工 `--shard i/N` 仍兼容（优先级最高）；单进程跑时行为与原来一致。
 > 其余（`quality_filter` 无 `--shard`——去重是全局状态，切分即错、`build_manifest`、`validate`、
-> `check_data_ready`、`convert_benchmarks`、`qa_eval`）都是**单进程秒~分钟级**，跑一次即可。
+> `check_data_ready`、`convert_benchmarks`、`qa_eval`）都是**单进程**，跑一次即可
+> （小规模秒~分钟级；全量几十万视频时 `quality_filter` 逐视频 decord 探帧，去重又是全局串行，
+> 要按小时级预留，但仍只能单进程跑）。
 > 完整坑位说明见仓库根 `run.md §0.2`，此处只给可直接跑的指令。
+>
+> 本质说明（8 卡机必读）：这三个脚本里的 torchrun **只做进程启动 + `RANK/WORLD_SIZE`
+> 分片，不建 NCCL 进程组、不做 DDP 同步**，各 rank 互不通信（`infer_qa` 的 rank0 合并除外，
+> 靠共享文件系统上的 `.part-*-of-*` + `.done` 轮询）。因此：
+> 单机改卡数只改 `--nproc_per_node`（= `nvidia-smi -L | wc -l`）；`--standalone` 即单节点
+> rendezvous（自动选空闲端口 + 随机 id，同时起两个 standalone 作业互不干扰；只有显式传了
+> `--rdzv-endpoint` 时才需给不同作业配不同端口）；
+> torchrun 命令是前台阻塞的，前一条退出码为 0 再跑下一步（`echo $?` 确认），不存在后台 wait；
+> `--shard auto` 在 torchrun 下显式写出是为可读性（不写也会因 `WORLD_SIZE>1` 自动分片），
+> 多机无 torchrun 时才用手工 `--shard i/N`（与 torchrun 不混用）。
 
 ```bash
 # 0) 仓库根 + 目录 + 环境自检
 cd /Users/bityangzi/python/LongVideo-main
 python3 tests/smoke_test.py
 mkdir -p logs results data/raw_videos data/features data/features_npy data/manifests
-
-# 0.1) 单机 8 卡 + 关键依赖门禁（起 8 卡前必过；不过就别往下跑，否则会静默产出空数据集）
-#   - decord 在 requirements.txt 里标为“可选”，但**真实抽特征链路是硬依赖**：
-#     adaptive_sampler.sample_video 与 qwen3_vl.make_reader 没有 decord 直接抛错；
-#     quality_filter 更隐蔽——缺 decord 时每个视频都判 decode_error、全量被剔除且不报错。
-#   - transformers 缺了 extract_features 加载不了 Qwen3-VL 视觉塔。
-#   - 缺什么装什么：pip install decord transformers
-python3 - <<'PY'
-import importlib, sys, torch
-ok = True
-n = torch.cuda.device_count()
-print(f"[preflight] cuda={torch.cuda.is_available()} 可见GPU={n}")
-if not (torch.cuda.is_available() and n >= 8):
-    print(f"[preflight] ❌ 需单机 8 卡，实测 {n} 张（改卡数只改 --nproc_per_node）"); ok = False
-for m in ("decord", "transformers"):
-    try:
-        importlib.import_module(m); print(f"[preflight] {m} OK")
-    except Exception as e:
-        print(f"[preflight] ❌ 缺 {m}：pip install {m}（{e}）"); ok = False
-sys.exit(0 if ok else 1)
-PY
 
 # 1) 质量筛选 + 去重：raw_videos/ → filtered.jsonl（CPU 单进程，无 --shard，别并行起 8 份）
 python3 -m data_pipeline.src.quality_filter \
@@ -124,35 +115,24 @@ torchrun --standalone --nproc_per_node=8 -m data_pipeline.src.extract_features \
 #   任改一个都会使参数指纹 sampler_fp 变化、旧缓存自动失效重算。先小子集定参，再全量跑。
 #   单视频失败隔离进 data/features/extract_failed.part-*-of-*.jsonl（各 rank 独立文件，
 #   汇总看 cat data/features/extract_failed.part-*-of-*.jsonl），不中断整批。
-
-# 2.1) 抽完立即核对产出：任一 rank 崩了 torchrun 即非零退出，但仍建议核对，
-#      带着残缺特征往下走会让 manifest/训练静默少样本。产出+失败 < 清单即判未完成。
-python3 - <<'PY'
-import glob, os
-man, out = "data/filtered.jsonl", "data/features"
-n_man = sum(1 for l in open(man) if l.strip())
-n_npz = len([f for f in os.listdir(out) if f.endswith(".npz")])
-n_fail = sum(sum(1 for l in open(p) if l.strip())
-             for p in glob.glob(os.path.join(out, "extract_failed*.jsonl"))
-             if os.path.exists(p))
-print(f"[extract-check] 清单={n_man} 产出.npz={n_npz} 失败记录={n_fail}（含历史）")
-if n_npz == 0 or n_npz + n_fail < n_man:
-    print("[extract-check] ❌ 产出不足：有分片没跑完，查 torchrun 各 rank 日志后再继续")
-elif n_fail:
-    print("[extract-check] ⚠ 存在失败视频（见 extract_failed.part-*-of-*.jsonl），确认非路径/解码问题再继续")
-else:
-    print("[extract-check] ✅ 清单内视频均已产出特征")
-PY
+#   失败日志是追加模式（open(..., "a")）：整轮干净重跑前先删旧文件，否则失败记录越积越多：
+#   rm -f data/features/extract_failed*.jsonl
+#   另：--dtype auto 在 CUDA 上即 bf16（与 pipeline.yaml extract.dtype: float16 默认不同，要固定用 fp16 请显式传 --dtype fp16）。
 
 # 3) 规模化存储转换（真 mmap，8 卡机上训练前必做）：features/*.npz → features_npy/*.npy(+.ts.npy)
 #    .npz 是 zip 归档，np.load 的 mmap 对它无效；不转的话 8 rank×8 worker 各自整载解压，主机会被吃爆。
-#    纯 CPU/IO 型：torchrun 只做分片加速，不占 GPU。8 个分片互不相交（files[rank::world]），
-#    同写一个 --out 安全。--shard-dirs 按 vid[:2] 两级散列，几十万文件必加。
+#    纯 CPU/IO 型：torchrun 只做分片加速，不占 GPU（也不建 NCCL 通信）。8 个分片互不相交（files[rank::world]），
+#    同写一个 --out 安全（同名子目录用 os.makedirs(exist_ok=True) 并发建即可）。--shard-dirs 按 vid[:2] 两级散列，几十万文件必加。
 torchrun --standalone --nproc_per_node=8 -m data_pipeline.src.npz_to_npy \
     --in data/features --out data/features_npy --shard-dirs --shard auto
 #   转完可加 --delete-src 删源 .npz 省盘（先确认下游 manifest 已指向 .npy）。
+#   合并溯源 meta（torchrun 不自动合并，infer_qa 才有 rank0 自动合并）：
+#   各 rank 只写 meta.jsonl.part-NNN-of-008，build_manifest 不读它（直接扫描 .npy），留作审计用。
+#   要一份完整的审计文件再手动拼：
+#   cat data/features_npy/meta.jsonl.part-*-of-*.jsonl > data/features_npy/meta.jsonl
 
-# 4) 构建训练 manifest（占位符对齐 + 标签）：等上面 wait 结束后再跑，否则 manifest 不全
+# 4) 构建训练 manifest（占位符对齐 + 标签）：等上一步 torchrun 退出码为 0 后再跑，否则 manifest 不全
+#    （torchrun 是前台阻塞命令，不需后台 wait；echo $? 确认 8 个 rank 全成功）。
 #    --prefer-npy 必须与 --feature-dir data/features_npy 配套（指着 .npz 目录加它会扫出 0 文件、
 #    写出空 manifest 且不报错）。--data-root 必须与训练脚本的 --data-root 一致（本文全用 data）。
 #    Stage-1 自监督：不给 --qa，每个特征出一条无问答样本
@@ -186,11 +166,15 @@ python3 -m data_pipeline.src.convert_benchmarks --bench longvideobench \
 #   把 --manifest 换成 data/manifests/lvb_val.jsonl（加 --video-root /data/LongVideoBench 仅当 manifest 用 rel_path 时）。
 #   转 .npy 同第 3 步。校验口径同第 5 步。
 #   推理（同样支持 torchrun：各 rank 写独立 part，rank0 等齐自动合并成 --out；
-#   接过真底座的检查点必须走仓库根 scripts/eval_benchmark.py，
-#   infer_qa 只用于 stand-in 链路自测，详见 run.md §0.2.3）：
+#   合并靠轮询 .done（默认等 1800s），单机共享文件系统可直接用；.part-*-of-* 合并后保留，
+#   合并后顺序是 rank 序而非原 manifest 序，qa_eval 按 query_id 关联所以不影响打分；
+#   infer_qa 现支持 Qwen 与 stand-in：新检查点从 metadata 恢复模型/tokenizer/LoRA；
+#   旧 Qwen 检查点需加训练时的 --base-model、--lora-r/--lora-alpha（或 --no-lora））：
 torchrun --standalone --nproc_per_node=8 -m data_pipeline.src.infer_qa \
     --manifest data/manifests/lvb_val.jsonl --data-root data --config configs/default.yaml \
     --ckpt checkpoints/stage2/final --out results/lvb_pred.jsonl --device cuda --shard auto
+#   核对：results/lvb_pred.jsonl 行数 == manifest 中 answer_index>=0 的行数；
+#   缺行先看 results/lvb_pred.jsonl.part-*-of-*.jsonl 是否 8 个齐 + 有无 .failed 文件。
 python3 -m data_pipeline.src.qa_eval --manifest data/manifests/lvb_val.jsonl \
     --pred results/lvb_pred.jsonl        # 出 整体/分task/分档(long) 准确率，GATE-4
 ```

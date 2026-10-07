@@ -24,6 +24,16 @@ def _compute_cpib(out: dict, model, w: LossWeights, step: int = 0):
     """CPIB-Distill auxiliary loss; returns (loss, components), zero when disabled."""
     if w.cpib is None or model.cpib is None:
         return 0.0, {}
+    if "legacy_cpib_loss" in out:
+        return out["legacy_cpib_loss"], out["legacy_cpib_components"]
+    if "cpib_losses" in out:
+        terms = out["cpib_losses"]
+        weights = {"contrastive_surrogate": w.cpib.nce, "mask_kl": w.cpib.kl,
+                   "representation_rate": w.cpib.representation,
+                   "counterfactual": w.cpib.cf}
+        # Prediction is already weighted by LossWeights.pred, not counted twice.
+        loss = sum(weights[k] * terms[k] for k in weights)
+        return loss, {"cpib_" + k: terms[k].detach() for k in weights}
     if "cpi_tokens" not in out or "cpib_tokens_raw" not in out:
         return 0.0, {}
     scores = out["cpi_tokens"]
@@ -62,9 +72,9 @@ def finetune_loss(out: dict, w: LossWeights, model=None, step: int = 0):
     if "spectral_reg" in out:
         total = total + w.spectral * out["spectral_reg"]
         comp["spectral"] = out["spectral_reg"].detach()
-    if "diff_kv_loss" in out and w.diff_kv > 0:
-        total = total + w.diff_kv * out["diff_kv_loss"]
-        comp["diff_kv"] = out["diff_kv_loss"].detach()
+    if "feature_codec_loss" in out and w.diff_kv > 0:
+        total = total + w.diff_kv * out["feature_codec_loss"]
+        comp["feature_codec"] = out["feature_codec_loss"].detach()
     if "visual_token_ratio" in out:  # commit-mode sparsity metric (log only)
         comp["visual_token_ratio"] = out["visual_token_ratio"]
     if model is not None:

@@ -16,7 +16,7 @@ def _step_functional(state, inputs, params, T: float, eta: float,
                      var_eps: float, mean: Tensor, var: Tensor,
                      gate_mode: str = "ste", dt_max: float = 1e3,
                      g_hard: Tensor | None = None,
-                     inv_lam: Tensor | None = None):
+                     inv_lam: Tensor | None = None, return_innovation: bool = False):
     """Single segment step; state/inputs/params are tensor tuples.
 
     g_hard optionally pins the hard gate from the forward pass so recomputation
@@ -39,9 +39,11 @@ def _step_functional(state, inputs, params, T: float, eta: float,
     yhat = (C_pi.unsqueeze(1) * xhat).real.sum(-1)
 
     s = torch.sqrt(var + var_eps)
-    diff = (u_l - yhat) / s
     obs = (u_l - mean) / s
-    r = diff.norm(dim=-1) / (obs.norm(dim=-1) + eta)
+    pred = (yhat - mean) / s
+    r = (obs - pred).norm(dim=-1) / (obs.norm(dim=-1) + eta)
+    target = obs.detach()
+    innovation = (target - pred).norm(dim=-1) / (target.norm(dim=-1) + eta)
     soft = torch.sigmoid((r - eps) / max(T, 1e-4))
     if gate_mode == "soft":
         g = soft
@@ -60,7 +62,8 @@ def _step_functional(state, inputs, params, T: float, eta: float,
     B_pi_n = gv * B_l + (1 - gv) * B_pi
     C_pi_n = gv * C_l + (1 - gv) * C_pi
     y = (C_l.unsqueeze(1) * hcur).real.sum(-1) + D * u_l
-    return (h_pi_n, t_pi_n, u_pi_n, B_pi_n, C_pi_n), y, g, r
+    result = ((h_pi_n, t_pi_n, u_pi_n, B_pi_n, C_pi_n), y, g, r)
+    return (*result, innovation) if return_innovation else result
 
 
 def _init_state(u, Bc, Cc, t, dt_init):
@@ -79,6 +82,7 @@ class GatedEACSCellFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, Bc, Cc, t, lam, log_dt, D, eps, mean, var,
                 T, eta, var_eps, dt_init, gate_mode, use_kernel, dt_max):
+        ctx.set_materialize_grads(False)
         B, L, H = u.shape
         if use_kernel and u.is_cuda and gate_mode == "ste":
             try:
@@ -90,26 +94,28 @@ class GatedEACSCellFunction(torch.autograd.Function):
                         dt_max=dt_max)
                     _ctx_save(ctx, u, Bc, Cc, t, lam, log_dt, D, eps, mean, var,
                               T, eta, var_eps, dt_init, gate_mode, L, dt_max, gs)
-                    return ys, gs, rs
+                    # Same values, separate output slot: backward detaches the target.
+                    return ys, gs, rs, rs.clone()
             except Exception:
                 pass
         with torch.no_grad():
             state = _init_state(u, Bc, Cc, t, dt_init)
-            ys, gs, rs = [], [], []
+            ys, gs, rs, ns = [], [], [], []
             inv_lam = torch.reciprocal(lam)
             for l in range(L):
-                state, y, g, r = _step_functional(
+                state, y, g, r, n = _step_functional(
                     state, (u[:, l], Bc[:, l], Cc[:, l], t[:, l]),
                     (lam, log_dt, D, eps), T, eta, var_eps, mean, var, gate_mode,
-                    dt_max=dt_max, inv_lam=inv_lam)
-                ys.append(y); gs.append(g); rs.append(r)
+                    dt_max=dt_max, inv_lam=inv_lam, return_innovation=True)
+                ys.append(y); gs.append(g); rs.append(r); ns.append(n)
             ys = torch.stack(ys, 1); gs = torch.stack(gs, 1); rs = torch.stack(rs, 1)
+            ns = torch.stack(ns, 1)
         _ctx_save(ctx, u, Bc, Cc, t, lam, log_dt, D, eps, mean, var,
                   T, eta, var_eps, dt_init, gate_mode, L, dt_max, gs)
-        return ys, gs, rs
+        return ys, gs, rs, ns
 
     @staticmethod
-    def backward(ctx, g_ys, g_gs, g_rs):
+    def backward(ctx, g_ys, g_gs, g_rs, g_ns):
         u, Bc, Cc, t, lam, log_dt, D, eps, mean, var, gs_fwd = ctx.saved_tensors
         T, eta, var_eps, dt_init, gate_mode, L = ctx.T, ctx.eta, ctx.var_eps, ctx.dt_init, ctx.gate_mode, ctx.L
         dt_max = ctx.dt_max
@@ -124,10 +130,10 @@ class GatedEACSCellFunction(torch.autograd.Function):
             inv_lam = torch.reciprocal(lam)
             for l in range(L):
                 prev.append(state)
-                state, _, _, _ = _step_functional(
+                state, _, _, _, _ = _step_functional(
                     state, (u[:, l], Bc[:, l], Cc[:, l], t[:, l]),
                     (lam, log_dt, D, eps), T, eta, var_eps, mean, var, gate_mode,
-                    dt_max=dt_max, g_hard=_g(l), inv_lam=inv_lam)
+                    dt_max=dt_max, g_hard=_g(l), inv_lam=inv_lam, return_innovation=True)
 
         du = torch.zeros_like(u); dBc = torch.zeros_like(Bc); dCc = torch.zeros_like(Cc); dt = torch.zeros_like(t)
         dlam = torch.zeros_like(lam); dlog = torch.zeros_like(log_dt); dD = torch.zeros_like(D); deps = torch.zeros_like(eps)
@@ -145,14 +151,16 @@ class GatedEACSCellFunction(torch.autograd.Function):
             lam_ = lam.detach().requires_grad_(True); log_ = log_dt.detach().requires_grad_(True)
             D_ = D.detach().requires_grad_(True); eps_ = eps.detach().requires_grad_(True)
             with torch.enable_grad():
-                (nh, nt, nu, nB, nC), y, g, r = _step_functional(
+                (nh, nt, nu, nB, nC), y, g, r, n = _step_functional(
                     (ph, pt, pu, pB, pC), (ul, Bl, Cl, tl), (lam_, log_, D_, eps_),
                     T, eta, var_eps, mean, var, gate_mode,
-                    dt_max=dt_max, g_hard=_g(l))
-            outs = [nh, nt, nu, nB, nC, y, g, r]
-            gouts = [ah, at, au, aB, aC, g_ys[:, l],
+                    dt_max=dt_max, g_hard=_g(l), return_innovation=True)
+            outs = [nh, nt, nu, nB, nC, y, g, r, n]
+            gouts = [ah, at, au, aB, aC,
+                     g_ys[:, l] if g_ys is not None else torch.zeros_like(y),
                      g_gs[:, l] if g_gs is not None else torch.zeros_like(g),
-                     g_rs[:, l] if g_rs is not None else torch.zeros_like(r)]
+                     g_rs[:, l] if g_rs is not None else torch.zeros_like(r),
+                     g_ns[:, l] if g_ns is not None else torch.zeros_like(n)]
             grads = torch.autograd.grad(outs, [ph, pt, pu, pB, pC, ul, Bl, Cl, tl, lam_, log_, D_, eps_],
                                         gouts, allow_unused=True, retain_graph=False)
             ah = _or_zeros(grads[0], ah); at = _or_zeros(grads[1], at)
@@ -179,8 +187,13 @@ def fused_gated_scan(u: Tensor, Bc: Tensor, Cc: Tensor, t: Tensor,
                      mean: Tensor, var: Tensor, T: float, eta: float,
                      var_eps: float = 1e-5, dt_init: float = 1.0,
                      gate_mode: str = "ste", use_kernel: bool = True,
-                     dt_max: float = 1e3):
-    """Differentiable fused gated scan; returns (ys[B,L,H], gates[B,L], resid[B,L])."""
-    return GatedEACSCellFunction.apply(u, Bc, Cc, t, lam, log_dt, D, eps, mean, var,
+                     dt_max: float = 1e3, return_innovation: bool = False):
+    """Return (y, gates, residual), optionally followed by stop-target innovation.
+
+    The fourth output has residual values but a distinct gradient: the current
+    observation is a detached target, including its normalizing denominator.
+    """
+    outputs = GatedEACSCellFunction.apply(u, Bc, Cc, t, lam, log_dt, D, eps, mean, var,
                                        T, eta, var_eps, dt_init, gate_mode, use_kernel,
                                        dt_max)
+    return outputs if return_innovation else outputs[:3]

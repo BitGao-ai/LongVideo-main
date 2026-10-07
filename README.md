@@ -2,13 +2,13 @@
 
 **简体中文** | [English](README_EN.md)
 
-> 设计方案对应 `CST-SSM-ICCV设计方案.tex/.md`。本仓库把方案中的**每个技术创新点**落成可读、高内聚低耦合、可训练、可推理的工程代码（纯 PyTorch + 变步长/门控 CUDA 内核），CPU 即可 `python tests/smoke_test.py` 跑通全链路。
+> 当前主线是 **EACS＋完整 CPIB**，实现范围、数学条件与未验证项见 [实施审计](paper/IMPLEMENTATION_AUDIT.md) 和 [修订设计](paper/CST-SSM-CVPR论文设计方案.md)。默认配置启用历史 SSM 条件的动态空间 Token、随机瓶颈与事件提交；CPU机制测试不等于真实QA效果或GPU加速证明。旧配置/检查点保留显式legacy路径。
 
 ---
 
 ## 1. 这是什么
 
-一个把视频当作**连续时间信号**建模的长视频理解框架。核心算子 **EACS（Event-Adaptive Continuous Scan）** 用真实物理 Δt 参数化状态演化，并用**预测编码式事件驱动稀疏更新**只在"事件"处更新状态——从而算力正比于**事件内容**、显存正比于**状态维**（与视频时长无关），且支持**任意时刻连续查询**。
+一个把视频当作**连续时间信号**建模的长视频理解框架。EACS用真实物理Δt演化状态，以预测残差决定提交；CPIB在历史状态条件下保留变长空间细节并送入LLM。前端与扫描仍随帧数增长，LLM成本取决于实际提交Token数；只有在线递推状态与视频长度无关，不能称全系统O(1)显存。任意时刻连续查询使用显式历史索引，也需要额外存储。
 
 四段式端到端架构（训练/推理逻辑一致，无外挂采样）：
 
@@ -27,8 +27,10 @@
 | ③ 事件驱动稀疏更新（预测编码残差门控） | `cst_ssm/modules/event_gate.py` |
 | **C1 EACS 主算子**（①+③融合，保持输入 ZOH 预测） | `cst_ssm/modules/eacs.py` |
 | 多尺度三分支 + 输入门控融合 | `cst_ssm/modules/multiscale.py` |
-| **C3 任意时刻连续查询**（突破 δ/4 地板） | `cst_ssm/modules/continuous_query.py` |
-| 并行 associative scan（Mamba-2 SSD 对应） | `cst_ssm/ops/scan.py` |
+| **连续查询**（与同款插值、偏移回归基线比较） | `cst_ssm/modules/continuous_query.py` / `models/adaptive_query.py` |
+| 非门控仿射并行scan（不等于事件门控的Mamba-2 SSD实现） | `cst_ssm/ops/scan.py` |
+| **逐层真实空间剪枝＋随机表征瓶颈** | `cst_ssm/modules/adaptive_tokens.py` |
+| **严格历史状态＋细节Token提交＋未来预测干预校准** | `cst_ssm/models/adaptive_path.py` / `modules/streaming.py` |
 | **变步长选择性扫描 CUDA 内核** | `cst_ssm/ops/csrc/eacs_scan_cuda.cu` · `scan_cuda.py` |
 | **门控 EACS cell 融合前向内核（推理）** | `cst_ssm/ops/csrc/eacs_cell_cuda.cu` · `eacs_gated_scan.py` |
 | **门控 cell 可微融合训练（autograd.Function）** | `cst_ssm/ops/eacs_cell_train.py` |
@@ -52,8 +54,13 @@ pip install torch>=2.1 safetensors>=0.4 numpy pyyaml     # 核心（必需）
 
 一键自检（零数据，CPU）：
 ```bash
-python tests/smoke_test.py
+python3 tests/smoke_test.py                     # legacy兼容基线
+python3 tests/regression_adaptive_pipeline.py  # 完整CPIB主链
+python3 tests/regression_qwen_adaptive.py      # 真实随机小Qwen接口，不下载权重
+python3 scripts/train_stage1.py --config configs/adaptive_cpu.yaml --device cpu --steps 2
 ```
+
+像素逐层剪枝配方：`configs/adaptive_pixel.yaml`。默认`configs/default.yaml`为离线特征后端压缩，不节省已运行的Qwen视觉塔计算。完整测试和数学边界见实施审计。
 
 ---
 
@@ -175,7 +182,7 @@ torchrun --standalone --nproc_per_node=8 scripts/train_stage2.py --ddp \
     --ckpt checkpoints/stage2 --load checkpoints/stage1/final \
     --batch-size 2 --num-workers 8 --steps 5000 --lora
 
-# 流式推理 / 连续查询（推理状态 O(1)，单卡即可）
+# 分块推理 / 连续查询（仅递推状态与L无关；历史索引、输出及LLM KV另计）
 python3 scripts/infer_stream.py --device cuda --frames 2000
 python3 scripts/infer_query.py --device cuda --frames 64 --nquery 200
 ```
@@ -289,7 +296,20 @@ model = build_cstssm_qwen3vl("Qwen/Qwen3-VL-4B-Instruct", d_model=768, lora=True
 - **特征缓存**：`feat_dim` 绑定视觉塔 `out_hidden_size`——换视觉塔维度需重抽特征（同代系列视觉塔常一致，切换前先核对 `vision_config.out_hidden_size`）。
 - **占位符/常量**：`video_token_id` 已从 `hf.config` 读取，天然适配变体差异。
 
-### 7.2 CUDA 变步长内核（`cst_ssm/ops/csrc/`）
+### 7.2 检查点恢复与推理契约
+
+`Trainer.save()` 保存实际 `model_config`，以及基础模型、tokenizer、精度和 LoRA 模块参数。
+`eval_benchmark.py`、`benchmarks/infer_grounding.py` 和 `data_pipeline.src.infer_qa` 共用恢复接口：
+新检查点可从 metadata 恢复 Qwen 或 stand-in；旧 Qwen 检查点需显式给出训练时的
+`--base-model`、`--config`、`--lora-r/--lora-alpha`（或 `--no-lora`）。不会把 Qwen 权重放入字节级模型壳中评分。
+数据特征维度必须匹配检查点；显式配置冲突会报错，不能用放宽 missing-key 校验掩盖。
+
+Qwen 构建保留 `llm.max_len` 并核对底座上下文上限。QA 评分、训练与生成共用视频占位符
+压缩/展开逻辑；`effective_labels` 与返回 logits 对齐。生成默认使用 HF EOS/pad 配置，
+传 `eos_token_id=[]` 可显式选择固定长度。数据采样同时约束帧、时间戳与占位符数量。
+`max_steps` 仍统计 micro-batches；不足一个梯度累积窗口的尾部会正确归一化并更新。
+
+### 7.3 CUDA 变步长内核（`cst_ssm/ops/csrc/`）
 
 两个内核（详见 `csrc/README.md`）：
 1. **变步长选择性扫描** `eacs_scan_cuda.cu`（fwd+bwd）——非门控连续 SSM 线性扫描，加速 `ContinuousSSMLayer`。
@@ -298,16 +318,14 @@ from cst_ssm.ops import selective_scan     # GPU→CUDA内核；CPU→纯PyTorch
 h = selective_scan(dA, dBu)                 # (B,L,H,N) complex，一阶线性递推
 ```
 2. **门控 EACS cell 融合前向** `eacs_cell_cuda.cu`（仅 fwd/推理）——事件门控稀疏更新的**流式推理**，
-   自动接入 `EACSLayer.forward` 推理快路（`not training and x.is_cuda and 内核可用`），显存 O(B·H·N) 与时长无关。
-3. **门控 cell 可微融合训练** `ops/eacs_cell_train.py`（`GatedEACSCellFunction`）——训练用 autograd.Function：
-   forward 无梯度顺序扫描（可用融合 CUDA 前向内核），backward **逆时重算 + 逐步 autograd 求 VJP** 的反向递推，
-   只携带状态伴随（**图显存 O(1)、与 L 无关**，正确构造无需手推公式）。开启：`CSTSSMConfig(eacs_fused_train=True)`。
+   自动接入符合条件的legacy `EACSLayer.forward`推理路径；递推状态为O(B·H·N)，序列输出仍随L增长。adaptive CPIB路径目前不用此内核。
+3. **门控cell可微融合训练** `ops/eacs_cell_train.py`：forward无梯度扫描，backward逐步重算VJP；包含独立stop-target innovation输出。保存的序列输入与反向状态记录仍随L增长，不是全程常数显存。开启：`CSTSSMConfig(eacs_fused_train=True)`（legacy路径）。
 
-- 反向伴随 conj 约定与 `torch.autograd` 对拍（<1e-6）；门控 cell 前向用纯 PyTorch 镜像 vs `EACSLayer` eval 对拍（<1e-6，含混合跳过）；可微训练 cell 用 `gradcheck`(double) + 与朴素全图 autograd 逐元素对拍（~1e-15）。均**无需 GPU 验证**。
-- 训练：`eacs_fused_train=True` 走可微融合 cell（常数图显存，等价序列 cell）；否则默认序列 cell（+可选分块检查点）。
-- 构建：JIT（首次调用自动编译）或 `FORCE_CUDA=1 pip install -e .`。无 GPU/编译失败自动回退，功能不受影响。
+- CPU回归比较普通/fused输出、loss和梯度，不能代替CUDA内核及墙钟性能验证。
+- adaptive路径使用严格历史的逐帧执行；分块推理见`stream_visual`。legacy路径可选分块检查点。
+- 构建：JIT（首次调用自动编译）或 `FORCE_CUDA=1 pip install -e .`；缺GPU时只验证PyTorch回退。
 
-### 7.3 其它可替换项
+### 7.4 其它可替换项
 - 预训练视觉骨干：`FeatureAdapter` 直接吃离线特征；或把 `WindowedSpatialEncoder` 换成 timm/CLIP/SigLIP。
 - 其它 HF 因果 LM：`VisionBackbone`/`LLMBackbone` Protocol + `CSTSSMModel(cfg, vision=..., llm=...)` 覆盖注入。
 - **部署**（vLLM / TensorRT-LLM）：接入点与流程见 `docs/DEPLOY.md`（LLM 段交推理框架，视觉+EACS 作轻量前处理）。
@@ -316,10 +334,10 @@ h = selective_scan(dA, dBu)                 # (B,L,H,N) complex，一阶线性�
 
 ## 8. 关键实现说明与边界
 
-- **保持输入的 ZOH 预测**（`eacs.py`）：跳过时 `x̂=Āx_π+B̄u_π`（保持上次输入），静态场景收敛稳态、残差恒 0、无虚假刷新——这是设计方案 Theorem 1(B) 干净成立的前提，也是相对 V1.0"自由演化"的正确性修正。
-- **事件门控产生稀疏的前提**：需要 SSM 先学会预测（stage-1）。**未训练模型在随机数据上更新率≈1 是正确的**（无法预测 → 都是事件）；训练后/真实冗余场景更新率显著下降（见 `infer_stream.py`）。门控机制本身正确性由 `EventGate` 单测保证（预测好→跳过、ε 单调控制稀疏率）。
+- **保持输入的ZOH预测**：跳过时保留上次输入驱动；innovation loss训练其预测能力，但不能据此推出dense/skip轨迹误差有界或无损语义压缩。反例与纠错见实施审计。
+- **事件稀疏需要训练验证**：未训练模型在随机数据上更新率接近1并不意外。`infer_stream.py`现在真正按块消费特征，但无checkpoint时只检查接口，不证明训练后稀疏率、QA质量或效率。
 - **复数对角 SSM**：状态复数、SSM 核心在 float32 计算（S4D 惯例），参数均为实数（谱分量 `a_log_neg_real/a_imag`、`log_dt_scale`），故可被 safetensors 保存。
-- **连续查询 δ/4 地板**：`continuous_query.py` 在帧间任意 t* 求值，配合 `benchmarks/` 的 CSG/VFR 验证突破离散分辨率下界。
+- **连续查询**：支持帧间实数时刻读出；δ/4不是所有离散模型的下界，应与同款插值、连续偏移/回归头比较。
 - 纯 PyTorch 序列扫描用于参考实现与门控路径；大 L 生产建议接 CUDA 内核。
 
 ---
@@ -330,5 +348,10 @@ h = selective_scan(dA, dBu)                 # (B,L,H,N) complex，一阶线性�
 python tests/smoke_test.py          # 核心ops→模块→模型→训练→分片→连续查询 全链路
 python tests/regression_fixes.py    # code-review 修复回归（LoRA 冻结 / masked 更新率 / 检查点单更新）
 python tests/regression_features.py # 补全功能回归（掩码重构 / stage2 pred / ε退火 / 6消融 / matrix_exp / QLoRA / EACS反向VJP）
+python tests/regression_review_numerics.py    # BF16、padding、adaptive rho、无损失流式路径
+python tests/regression_review_distributed.py # 真实 CPU/Gloo 双进程、辅助损失、尾部累积
+python tests/regression_review_restoration.py # metadata、随机小 Qwen、QA 坐标、EOS
+python tests/regression_review_data.py        # HF 预算/回退、pixel 入口、视频诊断
+python tests/regression_review_interfaces.py  # 跨入口模型/LoRA 恢复与逐选项评分
 ```
 覆盖：并行/序列扫描一致、ZOH 组合性、谱频段、端到端前反向、LoRA 占比、分片≤上限+round-trip、亚帧连续查询、可微融合训练等价、**EACS 反向 VJP 数值正确（双精度 gradcheck + 全图 autograd 逐元素对拍）**、全部补全功能。部署接入见 `docs/DEPLOY.md`。

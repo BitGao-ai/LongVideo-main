@@ -9,7 +9,14 @@ model:
   # Event-committed visual tokens: "all" = one token per frame; "commit" = only
   # frames where an observer branch committed an update reach the LLM, so the
   # LLM input length scales with events, not video duration.
-  visual_token_mode: all     # all | commit
+  visual_token_mode: commit  # all | commit; full spatial detail from submitted frames
+  cpib_distill: true
+  cpib_mode: adaptive
+  cpib_context_mode: ssm
+  cpib_min_tokens: 1
+  cpib_max_tokens: 16
+  cpib_threshold: 0.5
+  cpib_refresh_frames: 64    # static-detail safeguard; report its extra token cost
   innov_branches: [0]        # observer branches driving innov loss + commit selection
   branches:                  # Short/sec, mid/min, long/hour scales.
     - {name: short, n_state: 16, tau_min: 0.1,  tau_max: 1.0,    imag_scale: 1.0}
@@ -53,6 +60,11 @@ loss:
   update_rate: 0.1
   spectral: 0.05
   innov: 0.5                 # self-supervised predictive-coding (innovation) loss
+  cpib:
+    nce: 0.1                # history-conditioned surrogate, not a strict CMI estimate
+    kl: 0.01                # mask-score regularization only
+    cf: 0.05                # future prediction damage calibration
+    representation: 0.001  # Gaussian payload KL + finite selection metadata, in nats
 
 data:
   manifest: null

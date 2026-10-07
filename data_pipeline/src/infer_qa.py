@@ -35,6 +35,8 @@ def pick_option(scores) -> tuple:
 
 def build_example(tok, prompt: str, answer: str, max_len: int):
     """Concatenate prompt and answer with -100 labels on the prompt; truncate head first."""
+    if hasattr(tok, "set_video_tokens"):
+        return tok.build_lm_example(prompt, answer, max_len)
     p = [tok.BOS] + list(prompt.encode("utf-8"))
     a = list(answer.encode("utf-8")) + [tok.EOS]
     if len(p) + len(a) > max_len:
@@ -64,6 +66,13 @@ def score_options(model, tok, feats, ts, prompt: str, options, max_len: int = 10
     import torch
     n = len(options)
     answers = [LETTERS[i] if score_mode == "letter" else str(options[i]) for i in range(n)]
+    if hasattr(tok, "set_video_tokens"):
+        budget = min(feats.shape[0], *(tok.video_budget(max_len, a) for a in answers))
+        index = np.linspace(0, feats.shape[0] - 1, budget).round().astype(int)
+        feats, ts = feats[index], ts[index]
+        tok.set_video_tokens(budget)
+        if "<video>" not in prompt:
+            prompt = "<video>\n" + prompt
     examples = [build_example(tok, prompt, a, max_len) for a in answers]
 
     fast = hasattr(model, "encode_visual") and hasattr(model, "llm")
@@ -79,36 +88,35 @@ def score_options(model, tok, feats, ts, prompt: str, options, max_len: int = 10
 
     probe = _make_batch(feats, ts, examples[0][0], examples[0][1], device)
     with torch.no_grad():
-        visual_states, aux = model.encode_visual(probe)
+        visual_states, aux = (model.encode_visual(probe, collect_loss=False)
+                              if hasattr(model, "language_forward") else model.encode_visual(probe))
     scores = []
     for ids, labels in examples:
         iid = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
         lab = torch.tensor(labels, dtype=torch.long, device=device).unsqueeze(0)
         with torch.no_grad():
-            out = model.llm(input_ids=iid, visual_states=visual_states,
-                            attention_mask=torch.ones_like(iid, dtype=torch.bool),
-                            visual_mask=aux.get("visual_mask", probe["frame_mask"]),
-                            labels=lab)
+            if hasattr(model, "language_forward"):
+                text_batch = dict(probe, input_ids=iid, labels=lab,
+                                  attention_mask=torch.ones_like(iid, dtype=torch.bool))
+                out = model.language_forward(text_batch, visual_states, aux, need_logits=False)
+            else:
+                out = model.llm(input_ids=iid, visual_states=visual_states,
+                                attention_mask=torch.ones_like(iid, dtype=torch.bool),
+                                visual_mask=aux.get("visual_mask", probe["frame_mask"]), labels=lab)
         scores.append(-float(out["loss"]))
     return scores
 
 
 def build_default_model(feat_dim: int, d_model: int, ckpt: str | None, device: str,
-                        config: str | None = None):
-    import torch
-    from cst_ssm.models import CSTSSMModel, CSTSSMConfig
+                        config: str | None = None, return_tokenizer=False, **restore_options):
+    from cst_ssm.models import CSTSSMConfig
     from cst_ssm.modules.llm_interface import LLMConfig
-    if config:
-        from cst_ssm.utils import model_config_from_dict, load_yaml
-        cfg = model_config_from_dict(load_yaml(config)["model"])
-    else:
-        cfg = CSTSSMConfig(input_mode="feature", feat_dim=feat_dim, d_model=d_model,
+    from cst_ssm.utils.restoration import restore_model
+    default = CSTSSMConfig(input_mode="feature", feat_dim=feat_dim, d_model=d_model,
                            llm=LLMConfig(vocab_size=259, dim=128, n_layer=2, n_head=4, max_len=1024))
-    model = CSTSSMModel(cfg).to(device).eval()
-    if ckpt:
-        from cst_ssm.utils import load_checkpoint
-        load_checkpoint(model, ckpt, tag="infer_qa")
-    return model
+    model, tok = restore_model(ckpt=ckpt, config=config, feat_dim=feat_dim, default=default,
+                               device=device, **restore_options)
+    return (model, tok) if return_tokenizer else model
 
 
 def infer_manifest(rows, model, tok, data_root: str, max_len: int = 1024,
@@ -131,6 +139,10 @@ def infer_manifest(rows, model, tok, data_root: str, max_len: int = 1024,
 
 
 def run(args):
+    import torch
+    seed = getattr(args, "seed", 0)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     rows_all = [json.loads(l) for l in open(args.manifest, encoding="utf-8") if l.strip()]
     rank, world, local_rank = get_dist_info()
     si, sn, shard_desc, shard_src = resolve_shard(args.shard)
@@ -148,9 +160,10 @@ def run(args):
                 feat_dim = int(np.asarray(f).shape[-1]); break
             except Exception:
                 continue
-    from cst_ssm.data.dataset import ByteTokenizer
-    tok = ByteTokenizer()
-    model = build_default_model(feat_dim or 3584, args.d_model, args.ckpt, device, args.config)
+    model, tok = build_default_model(
+        feat_dim or 3584, args.d_model, args.ckpt, device, args.config, return_tokenizer=True,
+        **{k: getattr(args, k, None) for k in ("base_model", "dtype", "lora", "lora_r", "lora_alpha")},
+        max_video_tokens=getattr(args, "max_video_tokens", 8192))
     preds, fails = infer_manifest(rows, model, tok, args.data_root, args.max_len,
                                   args.score_mode, device)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -159,6 +172,12 @@ def run(args):
     with open(out_path, "w", encoding="utf-8") as f:
         for p in preds:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
+    with open(out_path + ".metadata.json", "w", encoding="utf-8") as f:
+        json.dump(dict(checkpoint=args.ckpt, config=getattr(args, "config", None),
+                       manifest=args.manifest, seed=seed, device=device,
+                       torch_version=torch.__version__, untrained=not bool(args.ckpt),
+                       score_mode=args.score_mode, shard_index=si, shard_count=sn,
+                       successful=len(preds), failed=len(fails)), f, ensure_ascii=False, indent=2)
     if fails:
         with open(fail_path, "w", encoding="utf-8") as f:
             for x in fails:
@@ -186,11 +205,19 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--base-model", default=None)
+    ap.add_argument("--dtype", default=None)
+    ap.add_argument("--lora", action="store_true", default=None)
+    ap.add_argument("--no-lora", dest="lora", action="store_false")
+    ap.add_argument("--lora-r", type=int, default=None)
+    ap.add_argument("--lora-alpha", type=float, default=None)
+    ap.add_argument("--max-video-tokens", type=int, default=8192)
     ap.add_argument("--score-mode", default="letter", choices=["letter", "text"])
     ap.add_argument("--feat-dim", type=int, default=None)
     ap.add_argument("--d-model", type=int, default=96)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--shard", default=None)
     run(ap.parse_args())
 

@@ -112,30 +112,41 @@ class HashDirectionScorer:
 class TrainedGroundingScorer:
     """Trained grounding-head scorer from --config plus --ckpt weights."""
 
-    def __init__(self, ckpt=None, config=None, d_model=96, device="cpu"):
+    def __init__(self, ckpt=None, config=None, d_model=96, device="cpu",
+                 base_model=None, dtype=None, lora=None, lora_r=None, lora_alpha=None):
         self.ckpt, self.config, self.d_model, self.device = ckpt, config, d_model, device
+        self.restore_options = dict(base_model=base_model, dtype=dtype, lora=lora,
+                                    lora_r=lora_r, lora_alpha=lora_alpha)
         self._model = None
         self._tok = None
         self._feat_dim = None
 
     def _build(self, feat_dim: int):
         import torch
-        from cst_ssm.models import CSTSSMModel, CSTSSMConfig
+        from cst_ssm.models import CSTSSMConfig
         from cst_ssm.modules.llm_interface import LLMConfig
-        from cst_ssm.data.dataset import ByteTokenizer
-        if self.config:
-            from cst_ssm.utils import model_config_from_dict, load_yaml
-            d = load_yaml(self.config)["model"]; d["grounding_head"] = True
-            cfg = model_config_from_dict(d)
-        else:
-            cfg = CSTSSMConfig(input_mode="feature", feat_dim=feat_dim, d_model=self.d_model,
+        from cst_ssm.utils.restoration import restore_model
+        default = CSTSSMConfig(input_mode="feature", feat_dim=feat_dim, d_model=self.d_model,
                                grounding_head=True,
                                llm=LLMConfig(vocab_size=259, dim=128, n_layer=2, n_head=4, max_len=64))
-        model = CSTSSMModel(cfg).to(self.device).eval()
-        if self.ckpt:
-            from cst_ssm.utils import load_checkpoint
-            load_checkpoint(model, self.ckpt, tag="grounding-scorer")
-        self._model, self._tok, self._feat_dim = model, ByteTokenizer(), feat_dim
+        self._model, self._tok = restore_model(
+            ckpt=self.ckpt, config=self.config, feat_dim=feat_dim, default=default,
+            device=self.device, grounding=True, **self.restore_options)
+        self._feat_dim = feat_dim
+
+    def predict_span(self, feats, ts, query):
+        """Regression baselines consume the same frames, with no denser observations."""
+        import torch
+        if self._model is None or self._feat_dim != feats.shape[-1]:
+            self._build(int(feats.shape[-1]))
+        if self._model.boundary_head is None:
+            return None
+        ids = self._tok.encode(query)[:512]
+        batch = dict(features=torch.as_tensor(np.array(feats, copy=True), device=self.device)[None],
+                     timestamps=torch.as_tensor(np.array(ts, copy=True), device=self.device)[None],
+                     input_ids=torch.tensor([ids], device=self.device))
+        with torch.no_grad():
+            return tuple(self._model.predict_boundaries(batch)[0].cpu().tolist())
 
     def score(self, feats, ts, t_query, query: str) -> np.ndarray:
         import torch
@@ -157,7 +168,9 @@ def build_scorer(args):
     if kind == "hash":
         return HashDirectionScorer(ckpt=args.ckpt, d_model=args.d_model, device=args.device)
     return TrainedGroundingScorer(ckpt=args.ckpt, config=args.config,
-                                  d_model=args.d_model, device=args.device)
+                                  d_model=args.d_model, device=args.device,
+                                  **{k: getattr(args, k, None) for k in
+                                     ("base_model", "dtype", "lora", "lora_r", "lora_alpha")})
 
 
 def load_features(feature_ref: str, data_root: str):
@@ -173,6 +186,11 @@ def load_features(feature_ref: str, data_root: str):
 
 
 def run(args):
+    import json
+    import torch
+    seed = getattr(args, "seed", 0)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     rows = read_jsonl(args.manifest)
     scorer = build_scorer(args)
     frame_grid = getattr(args, "frame_grid", False)
@@ -186,14 +204,28 @@ def run(args):
             # 即“离散模型 + 同款插值”。
             tq = (np.asarray(ts, dtype=np.float64) if frame_grid
                   else subframe_grid(ts, args.query_factor))
-            scores = scorer.score(feats, ts, tq, r.get("prompt", r.get("query", "")))
-            ps, pe = boundaries_from_scores(tq, scores, args.rel_thresh)
+            query = r.get("prompt", r.get("query", ""))
+            span = scorer.predict_span(feats, ts, query) if hasattr(scorer, "predict_span") else None
+            if span is not None:
+                ps, pe = span
+            else:
+                scores = scorer.score(feats, ts, tq, query)
+                ps, pe = boundaries_from_scores(tq, scores, args.rel_thresh)
             out.append({"query_id": r["query_id"], "pred_start": round(ps, 4),
                         "pred_end": round(pe, 4)})
         except Exception as e:
             n_fail += 1
             fails.append({"query_id": r.get("query_id"), "error": str(e)})
     write_jsonl(args.out, out)
+    metadata = dict(checkpoint=args.ckpt, config=getattr(args, "config", None),
+                    manifest=args.manifest, seed=seed, device=args.device,
+                    torch_version=torch.__version__, scorer=args.scorer,
+                    frame_grid=frame_grid, query_factor=args.query_factor,
+                    untrained=not bool(args.ckpt), successful=len(out), failed=n_fail)
+    if getattr(scorer, "_model", None) is not None:
+        metadata["grounding_mode"] = getattr(scorer._model.cfg, "grounding_mode", "query")
+    with open(args.out + ".metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
     if fails:
         write_jsonl(args.out + ".failed", fails)
     print(f"[infer] {len(out)} predictions -> {args.out}{' (%d failed)' % n_fail if n_fail else ''}")
@@ -211,6 +243,12 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--base-model", default=None)
+    ap.add_argument("--dtype", default=None)
+    ap.add_argument("--lora", action="store_true", default=None)
+    ap.add_argument("--no-lora", dest="lora", action="store_false")
+    ap.add_argument("--lora-r", type=int, default=None)
+    ap.add_argument("--lora-alpha", type=float, default=None)
     ap.add_argument("--scorer", default="trained", choices=["trained", "hash"])
     ap.add_argument("--query-factor", type=int, default=8)
     ap.add_argument("--frame-grid", action="store_true",
@@ -219,6 +257,7 @@ def main():
     ap.add_argument("--rel-thresh", type=float, default=0.5)
     ap.add_argument("--d-model", type=int, default=96)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--seed", type=int, default=0)
     run(ap.parse_args())
 
 

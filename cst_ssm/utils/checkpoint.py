@@ -163,7 +163,7 @@ def verify_shards(out_dir: str, hard_limit_bytes: int = 4 * 1024 ** 3) -> bool:
     return ok
 
 
-CRITICAL_SHAPE_PREFIXES = ("vision.",)
+CRITICAL_SHAPE_PREFIXES = ("vision.", "cpib.proj.", "cpib_context.")
 """Parameter prefixes whose shape mismatch must raise instead of being skipped."""
 
 
@@ -190,7 +190,8 @@ def _vision_mismatch_hint(critical: list, tag: str) -> str:
 
 def load_checkpoint(model, path: str, strict: bool = False,
                     max_missing_ratio: float = 0.5, tag: str = "ckpt",
-                    critical_prefixes: tuple = CRITICAL_SHAPE_PREFIXES):
+                    critical_prefixes: tuple = CRITICAL_SHAPE_PREFIXES,
+                    allow_architecture_migration: bool = False):
     """Load weights into model, reporting missing/unexpected keys and shape skips.
 
     Shape-mismatched tensors are dropped and counted as missing; critical prefixes
@@ -203,6 +204,20 @@ def load_checkpoint(model, path: str, strict: bool = False,
         sd = _torch.load(path, map_location="cpu")
         state = sd.get("model", sd) if isinstance(sd, dict) else sd
 
+    cfg = getattr(model, "cfg", None)
+    if cfg is not None and not allow_architecture_migration:
+        adaptive_model = bool(getattr(cfg, "cpib_distill", False)
+                              and getattr(cfg, "cpib_mode", "legacy") == "adaptive")
+        adaptive_weights = any(k.startswith("cpib.cgus.") for k in state)
+        if adaptive_model != adaptive_weights:
+            raise RuntimeError(
+                f"[{tag}] adaptive/legacy CPIB architecture mismatch. Use the checkpoint's "
+                "saved model_config, or explicitly request allow_architecture_migration=True "
+                "for partial initialization (not a resumed model).")
+        saved_cfg = checkpoint_metadata(path).get("model_config", {})
+        for key in ("cpib_mode", "cpib_context_mode", "input_mode"):
+            if adaptive_model and key in saved_cfg and saved_cfg[key] != getattr(cfg, key):
+                raise RuntimeError(f"[{tag}] checkpoint {key}={saved_cfg[key]!r} differs from model")
     model_sd = model.state_dict()
     shape_bad = [(k, tuple(v.shape), tuple(model_sd[k].shape)) for k, v in state.items()
                  if k in model_sd and hasattr(v, "shape") and v.shape != model_sd[k].shape]

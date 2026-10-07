@@ -7,10 +7,9 @@ committed state x_pi over the gap (t_k - t_pi):
     gate:           r_k = ||u_k - yhat_k|| / (||u_k|| + eta); skips keep commits.
     innovation:     same residual with the observation detached (stop-gradient target);
                     its square is the self-supervised predictive-coding loss that makes
-                    yhat_k a real prediction of u_k, so r_k measures novelty.
-                    This closes the gate-semantics gap in Theorem 1 and replaces the
-                    pseudo-inverse argument of Lemma 1 with an output-space bound over
-                    the observable subspace (paper/CST-SSM-CVPR论文设计方案.md §3).
+                    yhat_k predict u_k. Predictive novelty is not necessarily task
+                    importance; this loss alone gives no bound on the difference
+                    between dense and skipped state trajectories.
 Single-branch cost is O(L) sequential (gating breaks associativity).
 SSM math runs in float32 complex; outputs are cast back to the input dtype.
 """
@@ -36,7 +35,7 @@ class EACSOutput:
     gates: Tensor          # (B, L) per-step gates (1 = update, 0 = skip)
     update_rate: Tensor    # scalar mean(gate)
     residual: Tensor       # (B, L) normalized prediction residuals
-    innovation: Tensor | None = None  # (B, L) residual vs detached target; None on fused paths
+    innovation: Tensor | None = None  # (B, L) residual vs detached target
 
 
 def _readout(h: Tensor, C: Tensor) -> Tensor:
@@ -320,15 +319,16 @@ class EACSLayer(nn.Module):
             with torch.no_grad():
                 self._update_obs_stats(u, frame_mask)
             from ..ops.eacs_cell_train import fused_gated_scan
-            ys, gs, rs = fused_gated_scan(
+            ys, gs, rs, ns = fused_gated_scan(
                 u, Bc, Cc, t, lam, self.log_dt_scale, self.D, self.gate.eps,
                 self.obs_norm.running_mean, self.obs_norm.running_var,
                 float(self.gate.temperature), self.gate.norm_eta,
                 self.obs_norm.eps, self.dt_init, gate_mode="ste", use_kernel=True,
-                dt_max=self.dt_max)
+                dt_max=self.dt_max, return_innovation=True)
             delta = self.proj_out(ys.to(x_in.dtype))
             y = x_in + delta if self.add_residual else delta
-            return EACSOutput(y=y, gates=gs, update_rate=gs.mean(), residual=rs)
+            return EACSOutput(y=y, gates=gs, update_rate=gs.mean(), residual=rs,
+                              innovation=ns)
 
         if self.training:
             with torch.no_grad():

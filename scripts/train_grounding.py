@@ -134,6 +134,9 @@ def main():
         y, skip={"manifest", "val_manifest", "data_root", "mode", "batch_size",
                  "num_workers", "pin_memory", "drop_last", "persistent_workers"})
     lc.manifest, lc.data_root = manifest, data_root
+    lc.mode = cfg.input_mode
+    if ydata.get("mode", cfg.input_mode) != cfg.input_mode:
+        raise ValueError("data.mode must match model.input_mode")
     lc.batch_size, lc.num_workers = batch_size, num_workers
     lc.persistent_workers = num_workers > 0
     lc.feat_dim = cfg.feat_dim
